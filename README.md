@@ -180,7 +180,8 @@ When overloaded, ServerSentinel first keeps health state truthful and preserves 
 - Main deployment: versioned native release/systemd lifecycle; Docker Compose
   only after it provides equivalent external-runtime and rollback guarantees
 - Private remote access: Tailscale recommended
-- Notifications: Slack optional
+- Notifications: Slack optional; without it the Owner's dashboard shows a
+  fixed "no notification destination" banner on every screen (Issue #301)
 - Vision: pluggable permissively licensed detectors/models; source-code and model/weight licenses reviewed separately
 
 ## Core documents

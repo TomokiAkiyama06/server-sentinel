@@ -20,9 +20,14 @@ import type { Catalog } from '../i18n';
  *  monitoring runtime updates the underlying status once per tick (60 s). */
 export const CAMERA_OFFLINE_NOTICE_REFRESH_MS = 60000;
 
-export type OfflineNoticeState =
+/** One sampled Owner notice: its fixed cause word, or nothing to show
+ *  (`null`), once an answer arrived. Shared with the notification
+ *  destination notice (`notification_notice.tsx`). */
+export type SampledNotice<Cause extends string> =
   | { state: 'pending' | 'loading' | 'failed' }
-  | { state: 'ready'; cause: CameraOfflineCause | null };
+  | { state: 'ready'; cause: Cause | null };
+
+export type OfflineNoticeState = SampledNotice<CameraOfflineCause>;
 
 type Timers = {
   set(run: () => void, ms: number): unknown;
@@ -36,14 +41,14 @@ const realTimers: Timers = {
 /** Sample the notice now and every `refreshMs` after each answer, reporting
  *  every answer (or failure) until the returned `stop()`. Nothing is
  *  reported after `stop()`, and one sample is in flight at a time. */
-export function startOfflineNoticeSampling(
-  load: (signal: AbortSignal) => Promise<CameraOfflineCause | null>,
-  report: (next: OfflineNoticeState) => void,
+export function startOfflineNoticeSampling<Cause extends string = CameraOfflineCause>(
+  load: (signal: AbortSignal) => Promise<Cause | null>,
+  report: (next: SampledNotice<Cause>) => void,
   { refreshMs = CAMERA_OFFLINE_NOTICE_REFRESH_MS, timers = realTimers }: { refreshMs?: number; timers?: Timers } = {}) {
   const controller = new AbortController();
   let timer: unknown;
   const sample = async () => {
-    let next: OfflineNoticeState;
+    let next: SampledNotice<Cause>;
     try {
       next = { state: 'ready', cause: await load(controller.signal) };
     } catch {

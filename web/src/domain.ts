@@ -185,6 +185,12 @@ export type CalibrationResult =
  *  (Issues #301, #394). */
 export type CameraOfflineCause = 'not_configured' | 'delivery_failed';
 
+/** Why the Owner's notifications may not leave the Main Server at all (Issue
+ *  #301 follow-up): no notification destination (Slack) is configured, or
+ *  Slack is configured and a delivery of this Main Server start did not
+ *  reach it. */
+export type NotificationCause = 'not_configured' | 'delivery_failed';
+
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
   /** Owner access administration (Issue #10 phase 2 S4b routes A1-A6). The
@@ -209,6 +215,12 @@ export interface DashboardServices {
    *  Slack) or `'delivery_failed'` (Slack configured, the latest alert of a
    *  currently offline camera did not reach it); `null` otherwise. */
   loadCameraOfflineNotice?(signal: AbortSignal): Promise<CameraOfflineCause | null>;
+  /** The Owner's notification destination notice (Issue #301 follow-up,
+   *  `GET /api/monitoring/notifications`): `'not_configured'` (no Slack: no
+   *  Owner notification leaves the Main Server) or `'delivery_failed'` (Slack
+   *  configured, a delivery since this Main Server start did not reach it);
+   *  `null` otherwise. */
+  loadNotificationNotice?(signal: AbortSignal): Promise<NotificationCause | null>;
   /** The Owner's step-up ceremony (S3): a fresh user-verified assertion of
    *  this session's own passkey. Resolves only when the server accepted it. */
   stepUp?(signal: AbortSignal): Promise<void>;

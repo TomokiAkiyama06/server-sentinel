@@ -443,6 +443,63 @@ class CompositionTests(MonitoredAccessFixture):
                    storage_reservation=self.admission)
         self.assertIsNone(unmonitored.camera_offline_notice)
 
+    async def test_the_notification_notice_reads_the_monitoring_status(self):
+        """Issue #301 follow-up: the Owner's notification destination notice
+        is mounted with every monitoring runtime (with or without local UVC
+        sources) and reads its value-free status; without a monitoring
+        runtime it stays unmounted ("could not be checked" on the Web)."""
+        from dataclasses import replace
+
+        def monitored_access():
+            fresh = AccessFaultMonitor()
+            check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=fresh)
+            access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets,
+                                 store=self.store, reservation=check,
+                                 ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
+                                                              clock=self.ceremony_clock, findings=fresh))
+            return access, MonitoringDependencies(access_faults=fresh)
+
+        # No Slack, no local UVC source: "not configured" from the start,
+        # whatever the runtime state (it is never started here).
+        access, dependencies = monitored_access()
+        application = create_app(self.settings(), database=self.database, human_access=access,
+                                 storage_reservation=self.admission, monitoring=self.monitoring(),
+                                 monitoring_dependencies=dependencies)
+        self.assertIsNone(access.camera_offline_notice)
+        read = access.notification_notice
+        self.assertEqual("not_configured", read())
+        application.state.monitoring._set(state=RuntimeState.RUNNING,
+                                           notification_delivery_failed=True)
+        self.assertEqual("not_configured", read())
+        # Slack configured: unverified until running, then the delivery flag.
+        access, dependencies = monitored_access()
+        application = create_app(self.settings(), database=self.database, human_access=access,
+                                 storage_reservation=self.admission,
+                                 monitoring=replace(self.monitoring(), slack=endpoint()),
+                                 monitoring_dependencies=dependencies,
+                                 local_uvc=LocalUvcConfiguration((uuid4(),)))
+        runtime, read = application.state.monitoring, access.notification_notice
+        self.assertEqual("unverified", read())
+        runtime._set(state=RuntimeState.RUNNING)
+        self.assertEqual("delivered", read())
+        runtime._set(notification_delivery_failed=True)
+        self.assertEqual("delivery_failed", read())
+        # A failed runtime still sends and polls: a known failure stays shown.
+        runtime._set(state=RuntimeState.FAILED)
+        self.assertEqual("delivery_failed", read())
+        runtime._set(notification_delivery_failed=False)
+        self.assertEqual("unverified", read())
+        # No monitoring runtime: no reader, so the route is the generic denial.
+        other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
+        unmonitored = HumanAccess(
+            HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
+            reservation=other_check,
+            ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=other_check,
+                                         clock=self.ceremony_clock))
+        create_app(self.settings(), database=self.database, human_access=unmonitored,
+                   storage_reservation=self.admission)
+        self.assertIsNone(unmonitored.notification_notice)
+
     async def test_a_monitor_left_out_of_the_runtime_is_refused(self):
         """Codex PR #271 (P2): a monitor installed as a sink but not handed to
         the monitoring runtime would never be drained."""

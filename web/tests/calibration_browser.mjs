@@ -81,6 +81,8 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
     'GET /api/live/sources': () => json(200, { sources: [{ id: sourceId, name: '生成カメラ', health: 'online' }] }),
     // Issue #301: the Owner's camera offline notice, sampled after sign-in.
     'GET /api/monitoring/camera-offline': () => json(200, { offline_unnotified: false, cause: null }),
+    // Issue #301 follow-up: the Owner's notification destination notice.
+    'GET /api/monitoring/notifications': () => json(200, { cause: null }),
     'POST /api/auth/step-up/options': () => {
       const challenge = b64(randomBytes(32));
       state.challenges.push(challenge);
@@ -260,6 +262,32 @@ try {
     const notice = requests.find(item => item.path === '/api/monitoring/camera-offline');
     assert.equal(notice.method, 'GET');
     assert.equal(notice.headers['X-CSRF-Token'] ?? notice.headers['x-csrf-token'], undefined);
+  });
+
+  await scenario('the Owner sees the notification destination notice on every screen', {
+    handlers: (json, _stepUp, state) => ({ 'GET /api/monitoring/notifications': () => {
+      state.notificationLoads = (state.notificationLoads ?? 0) + 1;
+      return json(200, { cause: 'not_configured' });
+    } }),
+  }, async ({ page, ui, requests, state }) => {
+    // Issue #301 follow-up: one fixed banner while no Slack is configured.
+    await page.wait("document.querySelector('[data-notification-notice][role=alert]')?.dataset.notificationCause === 'not_configured'");
+    await ui.text('通知先が設定されていません');
+    await ui.open();
+    await ui.text('通知先が設定されていません');
+    assert.equal(state.notificationLoads, 1);
+    // The camera offline notice has nothing to show; only this banner is up.
+    assert.equal(await page.evaluate("document.querySelectorAll('[data-camera-offline-unnotified]').length"), 0);
+    const notice = requests.find(item => item.path === '/api/monitoring/notifications');
+    assert.equal(notice.method, 'GET');
+    assert.equal(notice.headers['X-CSRF-Token'] ?? notice.headers['x-csrf-token'], undefined);
+    assert.doesNotMatch(await page.evaluate('document.body.innerText'), /hooks\.slack/);
+  });
+
+  await scenario('a notification destination state that could not be checked is said so', {
+    handlers: json => ({ 'GET /api/monitoring/notifications': () => json(404, { detail: 'synthetic private error' }) }),
+  }, async ({ ui }) => {
+    await ui.text('通知先の状態を確認できませんでした。');
   });
 
   await scenario('a stale Owner confirms with the passkey and the calibration is sent once more', {

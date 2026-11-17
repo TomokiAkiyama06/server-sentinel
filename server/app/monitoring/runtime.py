@@ -33,7 +33,10 @@ from app.media.health.service import HealthResult, HealthState, RecordingHealthS
 from app.media.recording.model import RecordingError, SegmentValidator
 from app.media.recording.store import RecordingStore
 from app.notifications.schedule import DailySummaryScheduler
-from app.notifications.service import DailySummary, NotificationKind, NotificationService
+from app.notifications.service import (
+    NOTIFICATIONS_DELIVERED, NOTIFICATIONS_DELIVERY_FAILED, NOTIFICATIONS_NOT_CONFIGURED,
+    NOTIFICATIONS_UNVERIFIED, DailySummary, NotificationKind, NotificationService,
+)
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.storage.database import Database
 from app.storage.migrations import Migration, MigrationError, migrate
@@ -247,6 +250,35 @@ class MonitoringStatus:
     # Issue #407: a node's sessions keep replacing each other (more than one
     # connection presents its credential). Degraded in the daily summary.
     capture_node_contended: bool = False
+    # Issue #301 follow-up: whether a notification destination (Slack) is
+    # configured at all. Set once from the deployment configuration; without
+    # it no Owner notification (camera offline, capture node, hardware,
+    # recording health, human access, ...) leaves the Main Server.
+    notifications_configured: bool = False
+
+    @property
+    def notification_cause(self) -> str:
+        """One fixed word for the Owner's notification destination notice.
+
+        ``not_configured``: no Slack endpoint is configured, so no Owner
+        notification leaves the Main Server (a configuration fact, whatever
+        the runtime state). ``delivery_failed``: Slack is configured and at
+        least one delivery of this process did not reach it
+        (``notification_delivery_failed``, kept until the process restarts),
+        whatever the runtime state: a ``failed`` runtime still sends and
+        polls its immediate alerts, so a failure it saw is a fact (Claude
+        review, PR #424). ``unverified``: Slack is configured, no failure is
+        known and the runtime is not running, so "no failure" says nothing
+        yet (served as the generic denial, "could not be checked").
+        ``delivered`` otherwise.
+        """
+        if not self.notifications_configured:
+            return NOTIFICATIONS_NOT_CONFIGURED
+        if self.notification_delivery_failed:
+            return NOTIFICATIONS_DELIVERY_FAILED
+        if self.state != RuntimeState.RUNNING:
+            return NOTIFICATIONS_UNVERIFIED
+        return NOTIFICATIONS_DELIVERED
 
     @property
     def camera_offline_cause(self) -> str:
@@ -352,7 +384,8 @@ class MonitoringRuntime:
         self._status = MonitoringStatus(
             RuntimeState.STARTING,
             camera_offline_notifications=(self.dependencies.camera_offline is not None
-                                          and configuration.slack is not None))
+                                          and configuration.slack is not None),
+            notifications_configured=configuration.slack is not None)
         self._policy: MainStoragePolicy | None = None
         self._connection = None
         self._retry_at: dict[str, float] = {}

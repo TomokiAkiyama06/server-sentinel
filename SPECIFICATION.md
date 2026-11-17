@@ -2056,6 +2056,32 @@ source-type-neutral entry point for one. The daily summary still reports
 source counts as unavailable; its agent counts are capture-node connection
 counts, shown independently of that (§5.7, Issue #410).
 
+Independently of any current condition, the Owner's dashboard shows whether
+Owner notifications leave the Main Server at all (Issue #301 follow-up):
+
+```text
+GET /api/monitoring/notifications -> OWNER_READ:
+  200 {"cause": "not_configured" | "delivery_failed" | null}
+```
+
+`MonitoringStatus.notification_cause` decides it: `not_configured` while no
+Slack endpoint is configured (`notifications_configured`, from the
+configuration, whatever the runtime state: then no Owner notification,
+camera offline, capture node, hardware integrity, recording health, human
+access or scene, leaves the Main Server); otherwise `delivery_failed` once a
+delivery of this process did not reach Slack (`notification_delivery_failed`:
+a failed or refused delivery, kept until the process restarts, no automatic
+clear; also while the runtime is `failed`, which still sends and polls its
+immediate alerts), `unverified` while no failure is known and the monitoring
+runtime is not `running` (served as the generic denial, "could not be
+checked") and `delivered` (`null`) otherwise. Mounted with every monitoring runtime (without one, the generic
+denial); authorized, read and refused like the camera offline notice above
+(`touch=False`, inside `admit`, non-Owner sessions get the generic denial
+before the reader runs; one fixed word, never the webhook URL, an error, a
+count, a time or which notification). The Web shows it for an Owner session
+on every screen above the camera offline notice
+(`web/src/dashboard/notification_notice.tsx`), sampled on the same schedule.
+
 ## 10. Host hardware integrity and recording self-check
 
 ### 10.1 Hardware baseline

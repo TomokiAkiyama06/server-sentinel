@@ -723,6 +723,8 @@ try {
       await delay(500);
       assert.equal(frames().length, closed, 'no frame is pulled after the close');
       assert.equal(log.some(entry => entry.key.startsWith('GET /api/recordings') || entry.key.includes('timeline')), false);
+      // Owner-only notices (Issue #301): a live:view viewer never asks for them.
+      assert.equal(log.some(entry => entry.key.includes('/api/monitoring/')), false);
       // Sign-out: the caller's own session, then the sign-in shell.
       await page.evaluate("document.querySelector('.sign-out').click()");
       await until(() => log.some(entry => entry.key === 'POST /api/auth/sign-out'));

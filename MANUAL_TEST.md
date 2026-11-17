@@ -2934,6 +2934,33 @@ it never re-passes) is outside ServerSentinel and checked separately below.
   and the Main Server for over a minute replaces it with the "could not be
   checked" line, not with nothing.
 
+### Issue #301 notification destination banner (pending, not executed)
+
+Mock-verified only (`server/tests/test_notification_notice_route.py`,
+`server/tests/test_access_fault_notifications.py`,
+`web/tests/notification_notice.test.mjs`, `web/tests/calibration_browser.mjs`).
+Changing `slack_webhook_url` changes the production deployment and needs the
+Owner; restore it afterwards. Never record the webhook URL.
+
+- [ ] without `slack_webhook_url` (a temporary deployment change and a
+  restart): the Owner's dashboard shows "通知先が設定されていません" / "No
+  notification destination is configured" above every screen, on phone and
+  desktop, in ja and en, with no camera offline; nothing on the screen shows
+  a URL or setting value;
+- [ ] a `live:view`-only and a `recordings:view`-only viewer see no such
+  banner, and their `GET /api/monitoring/notifications` is the generic
+  not-found response (browser devtools);
+- [ ] with Slack configured and delivering: no banner;
+- [ ] (mock-verified only) with Slack configured but failing (a temporary
+  webhook URL Slack rejects, or the Main Server's outbound HTTPS blocked),
+  after an immediate notification was attempted: within about a minute the
+  banner shows "Slack に届かなかった通知があります" / "Some notifications did
+  not reach Slack"; it stays after Slack is restored and is gone after the
+  next restart;
+- [ ] right after a restart with Slack configured, the line "通知先の状態を
+  確認できませんでした。" may show until the monitoring runtime runs, then
+  disappears within about a minute.
+
 ### Issue #301 / #405 host-side check for cameras not passed (pending, not executed)
 
 Procedure: `infra/lxd/README.md`. Owner decision 2026-11-16 (Issue #405):

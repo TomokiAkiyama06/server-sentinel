@@ -6,6 +6,7 @@ import { AccessScreen } from './access/screen';
 import { CalibrationScreen } from './calibration/screen';
 import { LiveScreen } from './dashboard/live';
 import { CameraOfflineNotice, startOfflineNoticeSampling, type OfflineNoticeState } from './dashboard/offline_notice';
+import { NotificationNotice, type NotificationNoticeState } from './dashboard/notification_notice';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
 import { StorageView } from './setup/storage';
@@ -72,6 +73,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [storage, setStorage] = useState<Storage>({ state: 'pending' });
   const [wizard, setWizard] = useState<Wizard>({ state: 'pending' });
   const [offlineNotice, setOfflineNotice] = useState<OfflineNoticeState>({ state: 'pending' });
+  const [notificationNotice, setNotificationNotice] = useState<NotificationNoticeState>({ state: 'pending' });
   const [wizardBusy, setWizardBusy] = useState(false);
   const [wizardFailed, setWizardFailed] = useState(false);
   const [view, setView] = useState<View>('overview');
@@ -96,6 +98,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setStorage({ state: 'pending' });
     setWizard({ state: 'pending' });
     setOfflineNotice({ state: 'pending' });
+    setNotificationNotice({ state: 'pending' });
     setWizardBusy(false);
     setWizardFailed(false);
     setView('overview');
@@ -201,6 +204,19 @@ export function App({ services = deniedServices }: { services?: DashboardService
     if (!loader || access.state !== 'allowed' || access.role !== 'owner') return;
     setOfflineNotice({ state: 'loading' });
     return startOfflineNoticeSampling(loader, setOfflineNotice);
+  }, [services, access]);
+
+  useEffect(() => {
+    // Issue #301 follow-up: whether any Owner notification leaves the Main
+    // Server (no Slack configured, or a delivery of this start failed).
+    // Owner-only like the camera offline notice (the server refuses everyone
+    // else), sampled the same way: once the session is loaded and every
+    // CAMERA_OFFLINE_NOTICE_REFRESH_MS after each answer, without an idle
+    // touch on the server, shown on every screen.
+    const loader = services.loadNotificationNotice;
+    if (!loader || access.state !== 'allowed' || access.role !== 'owner') return;
+    setNotificationNotice({ state: 'loading' });
+    return startOfflineNoticeSampling(loader, setNotificationNotice);
   }, [services, access]);
 
   useEffect(() => {
@@ -324,6 +340,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
           {access.state === 'failed' && <section className="notice" role="alert"><h1>{t.failedTitle}</h1><p>{t.failed}</p><button className="primary" onClick={() => setAttempt(value => value + 1)}>{t.retry}</button></section>}
           {access.state === 'allowed' && <>
             {signOut === 'failed' && <p role="alert" className="notice-inline">{t.signOutFailed}</p>}
+            {access.role === 'owner' && <NotificationNotice t={t} notice={notificationNotice} />}
             {access.role === 'owner' && <CameraOfflineNotice t={t} notice={offlineNotice} />}
             <div className="page-heading"><div><span className="eyebrow">{t[access.role]}</span><h1>{t[selected]}</h1><p>{t[hint]}</p></div><span className="badge">{t.pending}</span></div>
             {selected === 'live' && canVisit(session, 'live') ? <LiveScreen services={services} t={t} />

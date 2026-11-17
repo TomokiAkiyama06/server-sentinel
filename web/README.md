@@ -557,6 +557,25 @@ the generic denial, shown as "could not be checked". Each cause has its own text
 GET /api/monitoring/camera-offline   200 {"offline_unnotified": <boolean>, "cause": "not_configured" | "delivery_failed" | null}
 ```
 
+`src/dashboard/notification_notice.tsx` (Issue #301 follow-up) shows the
+Owner, above every screen and above the camera offline notice, one fixed
+banner while no notification destination (Slack) is configured, so no Owner
+notification (camera offline, capture node, hardware, recording health, ...)
+leaves the Main Server, or, with its own title and text, while Slack is
+configured and a delivery since this Main Server start did not reach it
+(kept until the restart). It never shows the webhook URL, an error, a count,
+a time or which notification. Sampled like the camera offline notice
+(`startOfflineNoticeSampling`, 60 s, server-side `OWNER_READ` without an idle
+touch); a state the server could not check (the generic denial) is shown as
+`notificationsNoticeUnavailable`, never as nothing to report:
+
+```text
+GET /api/monitoring/notifications   200 {"cause": "not_configured" | "delivery_failed" | null}
+```
+
+`parseNotificationNotice` accepts only a `cause` of `null` or one of the two
+words; anything else fails closed as `invalid_response`.
+
 A cause that does not match the boolean, or a word outside the two, fails
 closed as `invalid_response` ("could not be checked").
 

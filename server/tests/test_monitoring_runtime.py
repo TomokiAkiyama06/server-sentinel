@@ -878,6 +878,8 @@ class SlackFailureTests(RuntimeFixture):
                 await self.settle(runtime)
                 self.assertEqual("failed", dict(self.events())["hardware_integrity_failure"])
                 self.assertTrue(runtime.status.notification_delivery_failed)
+                # Issue #301 follow-up: the Owner's banner word, Slack configured.
+                self.assertEqual("delivery_failed", runtime.status.notification_cause)
         output = "\n".join(logs.output)
         self.assertNotIn("hooks.slack.com", output)
         self.assertNotIn("generated private failure", output)

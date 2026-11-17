@@ -23,7 +23,7 @@ import { ApiError } from '../api';
 import {
   calibrationReasons, type AccessCredential, type AccessPrincipal, type CalibrationReason, type CalibrationResult,
   type CameraHealth, type CameraOfflineCause, type DashboardServices, type IssuedInvitation, type LiveFrame,
-  type LiveGrant, type LiveSource,
+  type LiveGrant, type LiveSource, type NotificationCause,
   type Permission, type SceneCalibrationSource, type Session,
 } from '../domain';
 import { decodeRequestOptions, serializeAssertion, type AssertionJSON } from './webauthn';
@@ -43,6 +43,8 @@ export const SCENE_CALIBRATION_PATH = '/api/scene/calibration';
 export const SCENE_SOURCES_PATH = '/api/scene/sources';
 /** The Owner's camera offline notice (Issue #301). */
 export const CAMERA_OFFLINE_NOTICE_PATH = '/api/monitoring/camera-offline';
+/** The Owner's notification destination notice (Issue #301 follow-up). */
+export const NOTIFICATION_NOTICE_PATH = '/api/monitoring/notifications';
 /** A calibration reads the next good camera frames before it answers (the
  *  server bounds that at 30 s at most), so its request gets a longer bound. */
 export const CALIBRATION_REQUEST_MS = 45000;
@@ -291,6 +293,23 @@ export function parseCameraOfflineNotice(value: unknown): CameraOfflineCause | n
     return null;
   }
   const cause = CAMERA_OFFLINE_CAUSES.find(item => item === value.cause);
+  if (cause === undefined) throw new ApiError('invalid_response');
+  return cause;
+}
+
+const NOTIFICATION_CAUSES: readonly NotificationCause[] = ['not_configured', 'delivery_failed'];
+
+/** `GET /api/monitoring/notifications` body `{"cause": "not_configured" |
+ * "delivery_failed" | null}` (Issue #301 follow-up).
+ *
+ * Returns the cause, or `null` when there is nothing to show. A state the
+ * server could not check arrives as the generic denial. Anything else fails
+ * closed: a missing `cause`, or a value outside `null` and the two words, is
+ * never read as "nothing to show". Nothing else is copied. */
+export function parseNotificationNotice(value: unknown): NotificationCause | null {
+  if (!record(value) || !('cause' in value)) throw new ApiError('invalid_response');
+  if (value.cause === null) return null;
+  const cause = NOTIFICATION_CAUSES.find(item => item === value.cause);
   if (cause === undefined) throw new ApiError('invalid_response');
   return cause;
 }
@@ -600,6 +619,15 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
           signal: bound });
         if (response.status !== 200) throw new ApiError('unavailable');
         return parseCameraOfflineNotice(await json(response, bound));
+      });
+    },
+
+    async loadNotificationNotice(signal) {
+      return bounded(signal, async bound => {
+        const response = await send({ method: 'GET', path: NOTIFICATION_NOTICE_PATH, accept: 'application/json',
+          signal: bound });
+        if (response.status !== 200) throw new ApiError('unavailable');
+        return parseNotificationNotice(await json(response, bound));
       });
     },
 

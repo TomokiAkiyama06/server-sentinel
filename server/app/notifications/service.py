@@ -16,6 +16,20 @@ from app.stop_budget import SETTLE_POLL_OVERSHOOT_SECONDS
 from app.storage.policy import StorageState
 
 
+# The fixed words of the Owner's notification destination notice (Issue #301
+# follow-up), `MonitoringStatus.notification_cause`: whether the Owner's
+# notifications (camera offline, capture node, hardware, recording health,
+# human access, ...) leave the Main Server at all. The human route serves the
+# first three and answers ``unverified`` with the generic denial ("could not
+# be checked" on the Web, never a guessed "nothing to report").
+NOTIFICATIONS_DELIVERED = "delivered"
+NOTIFICATIONS_NOT_CONFIGURED = "not_configured"
+NOTIFICATIONS_DELIVERY_FAILED = "delivery_failed"
+NOTIFICATIONS_UNVERIFIED = "unverified"
+NOTIFICATION_CAUSES = frozenset({NOTIFICATIONS_DELIVERED, NOTIFICATIONS_NOT_CONFIGURED,
+                                 NOTIFICATIONS_DELIVERY_FAILED, NOTIFICATIONS_UNVERIFIED})
+
+
 class NotificationKind(StrEnum):
     SERVER_MOVEMENT = "server_movement"
     CAMERA_TAMPER = "camera_tamper"

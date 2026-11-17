@@ -122,7 +122,18 @@ WebSocket and error path gets the same generic denial):
   Issue #394, judged per source), otherwise ``null``; one that could not be
   read is the generic denial. One
   boolean and one fixed word: no source id, name, count, time, error or
-  setting value. The
+  setting value.
+- the Owner's notification destination notice (Issue #301 follow-up),
+  mounted only when the embedder attached its reader
+  (``HumanAccess.attach_notification_notice``; otherwise the generic
+  denial): ``GET /api/monitoring/notifications`` (``OWNER_READ``) answers
+  ``200 {"cause": "not_configured" | "delivery_failed" | null}``.
+  ``not_configured``: no notification destination (Slack) is configured, so
+  no Owner notification leaves the Main Server; ``delivery_failed``: Slack
+  is configured and a delivery of this Main Server process did not reach it.
+  A state that could not be checked (the monitoring runtime not running) is
+  the generic denial. One fixed word: never the webhook URL, an error, a
+  count, a time or which notification. The
   Web polls it in the background, so it never extends the session's idle
   expiry (``touch=False``, Codex PR #388).
 
@@ -219,6 +230,9 @@ from app.media.live.frame_pull import LiveFrameService
 from app.monitoring.cameras import (
     CAMERA_OFFLINE_CAUSES, CAMERA_OFFLINE_NOTIFIED, CAMERA_OFFLINE_UNVERIFIED,
 )
+from app.notifications.service import (
+    NOTIFICATION_CAUSES, NOTIFICATIONS_DELIVERED, NOTIFICATIONS_UNVERIFIED,
+)
 from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
 from .live_access import BoundLiveAccess
@@ -265,6 +279,8 @@ SCENE_CALIBRATION_PATH = "/api/scene/calibration"
 SCENE_SOURCES_PATH = "/api/scene/sources"
 # Issue #301 item 2: the Owner's camera offline notice.
 CAMERA_OFFLINE_NOTICE_PATH = "/api/monitoring/camera-offline"
+# Issue #301 follow-up: the Owner's notification destination notice.
+NOTIFICATION_NOTICE_PATH = "/api/monitoring/notifications"
 MAX_CALIBRATE_BODY = 128
 MAX_LIVE_OPEN_BODY = 128
 MAX_OPTIONS_BODY = 1024
@@ -498,6 +514,11 @@ ROUTES: tuple[Route, ...] = (
     # of reaches no notification destination. OWNER_READ: the notification
     # configuration is the Owner's alone.
     Route("GET", _exact(CAMERA_OFFLINE_NOTICE_PATH), Requirement.OWNER_READ, "_camera_offline_notice",
+          mutating=False, csrf=False, body_limit=0),
+    # Issue #301 follow-up: whether the Owner's notifications leave the Main
+    # Server at all. OWNER_READ like the camera offline notice: deployment
+    # configuration and delivery health are the Owner's alone.
+    Route("GET", _exact(NOTIFICATION_NOTICE_PATH), Requirement.OWNER_READ, "_notification_notice",
           mutating=False, csrf=False, body_limit=0),
 )
 
@@ -835,6 +856,9 @@ class HumanAccess:
         # Optional component (``attach_camera_offline_notice``, Issue #301):
         # without it the notice route is the generic denial.
         self.camera_offline_notice: Callable[[], str] | None = None
+        # Optional component (``attach_notification_notice``, Issue #301
+        # follow-up): without it the notice route is the generic denial.
+        self.notification_notice: Callable[[], str] | None = None
         # S7 interim live (optional component, ``attach_live``): without it
         # every live route is the generic denial.
         self.live: LiveFrameService | None = None
@@ -905,6 +929,24 @@ class HumanAccess:
         if self.camera_offline_notice is not None and self.camera_offline_notice is not read:
             raise HumanAccessUnavailable()
         self.camera_offline_notice = read
+
+    def attach_notification_notice(self, read: Callable[[], str]) -> None:
+        """Mount the Owner's notification destination notice over ``read``.
+
+        Issue #301 follow-up. ``read()`` answers one fixed word
+        (``MonitoringStatus.notification_cause``): ``"delivered"``,
+        ``"not_configured"`` (no notification destination, Slack, is
+        configured), ``"delivery_failed"`` (Slack is configured and a delivery
+        of this process did not reach it) or ``"unverified"`` (served as the
+        generic denial). It must be quick and never block: it runs on a
+        worker thread inside ``admit`` of the authorization's epoch. Attached
+        once; another reader is refused.
+        """
+        if not callable(read):
+            raise HumanAccessUnavailable()
+        if self.notification_notice is not None and self.notification_notice is not read:
+            raise HumanAccessUnavailable()
+        self.notification_notice = read
 
     def _attach_live(self, live: LiveFrameService) -> None:
         previous = self.live
@@ -1875,6 +1917,38 @@ class HumanSurface:
         cause = None if value == CAMERA_OFFLINE_NOTIFIED else value
         await self._json(request.send, 200, {"offline_unnotified": cause is not None,
                                              "cause": cause})
+
+    async def _notification_notice(self, request: _Request) -> None:
+        """``GET /api/monitoring/notifications`` (``OWNER_READ``, Issue #301).
+
+        Same authorization as ``_camera_offline_notice``: read inside
+        ``admit`` of the authorization's epoch after the Owner session was
+        read again, with ``touch=False`` (the Web samples it every 60 s
+        without user interaction). ``200 {"cause": "not_configured" |
+        "delivery_failed" | null}``. ``unverified``, any other value from the
+        reader, or a reader failure is the generic denial, never a guessed
+        ``null``.
+        """
+        read = self.access.notification_notice
+        if read is None:
+            raise _Denied()
+        authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
+        access = self.access
+
+        def answer():
+            with access.admit(authorized.epoch):
+                access.store.require_owner_read_session(authorized.session)
+                return read()
+
+        try:
+            value = await asyncio.to_thread(answer)
+        except Exception:
+            raise _Denied() from None
+        if (type(value) is not str or value not in NOTIFICATION_CAUSES
+                or value == NOTIFICATIONS_UNVERIFIED):
+            raise _Denied()
+        await self._json(request.send, 200,
+                         {"cause": None if value == NOTIFICATIONS_DELIVERED else value})
 
     async def _scene_calibrate(self, request: _Request) -> None:
         """``POST /api/scene/sources/<source>/calibration`` (``OWNER_OP``, CSRF).
