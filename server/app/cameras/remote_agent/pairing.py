@@ -246,6 +246,22 @@ def active_node_ids_on(connection) -> tuple[UUID, ...]:
     return tuple(UUID(row[0]) for row in rows)
 
 
+def active_credential_expiries_on(connection) -> dict[UUID, float]:
+    """``{node: not_after}`` of every active credential with a recorded expiry (Issue #426).
+
+    The expiry of the node's current credential, as the ledger records it:
+    set at activation and moved on the first admission of a renewed
+    certificate, so a renewal staged but not presented yet does not count.
+    Read on ``connection`` (the monitoring provider's pinned read-only one,
+    ``app.main``), bounded like the expiry listing; no key, serial or digest.
+    """
+    rows = connection.execute(
+        "SELECT node_id, not_after FROM pairing_node_credentials WHERE state = 'active' "
+        "AND not_after IS NOT NULL ORDER BY node_id LIMIT ?", (_MAX_EXPIRY_ROWS,),
+    ).fetchall()
+    return {UUID(row[0]): float(row[1]) for row in rows}
+
+
 def credential_state_on(connection, node_id: UUID) -> str | None:
     """The state of ``node_id``'s credential (``active`` / ``revoked``), or None if it has none.
 

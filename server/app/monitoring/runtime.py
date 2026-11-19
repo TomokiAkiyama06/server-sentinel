@@ -49,7 +49,10 @@ from .cameras import (
     CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_NOT_CONFIGURED, CAMERA_OFFLINE_NOTIFIED,
     CAMERA_OFFLINE_UNVERIFIED, CameraOfflineMonitor,
 )
-from .capture_nodes import NODE_NOTICE_KINDS, CaptureHealthStatus, CaptureNodeHealthMonitor
+from .capture_nodes import (
+    CREDENTIAL_HISTORY_ROWS, CREDENTIAL_NOTICE_KINDS, NODE_NOTICE_KINDS, CaptureHealthStatus,
+    CaptureNodeHealthMonitor,
+)
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore, RunMarkerStore
@@ -69,11 +72,13 @@ CRITICAL_KINDS = (
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
     NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST, NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
+    NotificationKind.CAPTURE_CREDENTIAL_CRITICAL,
 )
 # `recording_device_numbers_changed` is not listed: the daily summary counts
 # the `recording_device_numbers_stale` flag instead, every day until fixed.
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
-                 NotificationKind.RECORDING_HEALTH_WARNING)
+                 NotificationKind.RECORDING_HEALTH_WARNING,
+                 NotificationKind.CAPTURE_CREDENTIAL_WARNING)
 # Kernel per-boot random UUID (Issue #321): the stale device-number notice is
 # sent once per boot and device numbers, not on every restart.
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -1300,9 +1305,13 @@ class MonitoringRuntime:
             # process are not counted (at worst one goes out early);
             # `capture_node_cap_unrestored` says so, and the failure is logged
             # once per episode, not on every tick.
+            # Issue #426: what credential notices were sent, read in the same
+            # step; until it was read the expiry is not evaluated, so a
+            # restart never repeats a warning already sent.
             try:
                 monitor.restore_window(self._capture_notice_rows(self.dependencies.utcnow()),
                                        monotonic=self.dependencies.monotonic())
+                monitor.restore_credential_notices(self._credential_notice_rows())
             except Exception:
                 if not self.status.capture_node_cap_unrestored:
                     logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
@@ -1351,6 +1360,31 @@ class MonitoringRuntime:
                 age = (now - datetime.fromisoformat(accepted)).total_seconds()
                 restored.append((UUID(event_id), NotificationKind(kind),
                                  datetime.fromisoformat(at), age))
+            except (TypeError, ValueError):
+                continue
+        return restored
+
+    def _credential_notice_rows(self):
+        """``(event ID, kind, UTC at)`` of the newest stored credential notices (#426).
+
+        Any age the notification retention kept, newest first and bounded
+        (`CREDENTIAL_HISTORY_ROWS`); matched to nodes by
+        `capture_nodes.notice_id`. A `pending` row counts as sent, as for the
+        cap; an unreadable row is left out.
+        """
+        rows = self._connection.execute(
+            "SELECT event_id, kind, at FROM notification_events WHERE kind IN ({}) "
+            "AND confirmed = 1 ORDER BY at DESC LIMIT ?".format(
+                ",".join("?" for _ in CREDENTIAL_NOTICE_KINDS)),
+            (*(kind.value for kind in CREDENTIAL_NOTICE_KINDS), CREDENTIAL_HISTORY_ROWS),
+        ).fetchall()
+        restored = []
+        for event_id, kind, at in rows:
+            try:
+                stamp = datetime.fromisoformat(at)
+                if stamp.tzinfo is None:
+                    continue
+                restored.append((UUID(event_id), NotificationKind(kind), stamp))
             except (TypeError, ValueError):
                 continue
         return restored

@@ -86,8 +86,12 @@ anything is signed, so a retry after the CA fell below the leaf validity still
 receives it (#148). A connection that loses a concurrent promotion
 of the same staged renewal is admitted if its exact key and certificate are by
 then the active credential (Issue #121).
-`CaptureCredentialMonitor` raises the local `capture_credential_warning`
-notification through an injected hook in three cases: a credential within
+The application notifies the Owner of a credential near expiry from the
+monitoring worker (`app/monitoring/capture_nodes.py`, Issue #426: warning at
+14 days, critical at 3 days, one recovery after a renewal) and never of a
+single refused renewal (Owner decision 2026-11-19).
+`CaptureCredentialMonitor` (not wired into the application) raises
+`capture_credential_warning` through an injected hook in three cases: a credential within
 14 days of expiry, an expired credential, or a refused renewal. A renewal
 refused because the deployment CA expires before the requested leaf would is
 reported as `renewal_ca_validity_insufficient` (not `renewal_request_invalid`)
@@ -241,10 +245,10 @@ this protocol.
 
 Not yet (follow-ups of #14): media frames and their continuity/ingest path
 with the durable consumer; an Owner status page for node health and the
-listener (the notices are `app/monitoring/capture_nodes.py`, Issue #14);
-an application hook for `CaptureCredentialMonitor`, so a refused renewal
-raises the Owner's `capture_credential_warning` (the listener status counts
-refusals by word meanwhile).
+listener (the notices are `app/monitoring/capture_nodes.py`, Issue #14).
+A refused renewal is not notified on its own (Owner decision 2026-11-19; the
+listener status counts refusals by word); one that keeps failing reaches the
+Owner as the credential expiry notices of Issue #426.
 
 ## Bootstrap enrollment listener and local approval CLI (Issue #13)
 

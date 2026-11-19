@@ -213,7 +213,13 @@ running tick, `capture_node_cap_unrestored` is set and `monitoring_degraded`
 is logged once per failure episode (Issue #410). `capture_node_notices_held`
 reports an owed notice still held (cap, full queue, refused write);
 `capture_node_contended` a node whose sessions keep replacing each other
-(the registry's `contended()`, Issue #407), degraded in the summary. The daily
+(the registry's `contended()`, Issue #407), degraded in the summary. For
+credential expiry (Issue #426) the provider also returns each active node's
+current `not_after` (`pairing.active_credential_expiries_on`, same
+connection); the first running tick reads the newest credential notice rows
+with the cap rows (`_credential_notice_rows` -> `restore_credential_notices`),
+and the expiry is not evaluated until it did, so a restart repeats no notice
+already sent. The daily
 summary fills `agents_online` / `agents_offline` from its counts and shows them
 independently of the capture pipeline, as connection counts only, whenever the
 latest drain read the expected nodes (`nodes_counted`; otherwise

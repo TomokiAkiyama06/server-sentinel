@@ -53,9 +53,17 @@ class NotificationKind(StrEnum):
     # recording-health verdict). They are never an immediate Slack message.
     HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
     RECORDING_HEALTH_WARNING = "recording_health_warning"
-    # Capture-node certificate approaching expiry without renewal, expired, or
-    # a refused renewal (Issue #13). Local Owner-visible warning only.
+    # Capture-node certificate approaching expiry without renewal (Issue #13).
+    # Issue #426 (Owner decision 2026-11-19; `../monitoring/capture_nodes.py`):
+    # an active node's current certificate expires within 14 days and was
+    # not renewed (attention notice), within 3 days or already expired
+    # (critical alert), and one recovery notice once a renewal (or a
+    # re-pairing) moved the expiry beyond 14 days after one of them was
+    # sent. A single refused or unavailable renewal is never notified.
+    # Value-free: no node, serial, expiry or reason.
     CAPTURE_CREDENTIAL_WARNING = "capture_credential_warning"
+    CAPTURE_CREDENTIAL_CRITICAL = "capture_credential_critical"
+    CAPTURE_CREDENTIAL_RECOVERED = "capture_credential_recovered"
     # The deployment capture-node CA or the Main ingest listener certificate is
     # expiring, or the CA is too close to expiry to issue/renew node leaves at
     # the configured validity (Issues #125/#127). Local Owner-visible warning.
@@ -100,6 +108,8 @@ IMMEDIATE_KINDS = frozenset({
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
     NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST, NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
+    NotificationKind.CAPTURE_CREDENTIAL_WARNING, NotificationKind.CAPTURE_CREDENTIAL_CRITICAL,
+    NotificationKind.CAPTURE_CREDENTIAL_RECOVERED,
 })
 # Immediate only when confirmed: a confirmed server movement / camera tamper
 # (Issue #26), and a camera source offline for the deployment's threshold
@@ -110,12 +120,15 @@ CONFIRMED_IMMEDIATE_KINDS = frozenset({
     NotificationKind.CAMERA_OFFLINE,
 })
 # Immediate, but the end of a fault rather than an alert.
-RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED})
+RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED,
+                            NotificationKind.CAPTURE_CREDENTIAL_RECOVERED})
 # Immediate, but a condition needing Owner attention rather than a failure:
 # monitoring and recording continue (Issue #321).
 ATTENTION_KINDS = frozenset({
     NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED, NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED,
+    # Issue #426: 14 days or less left; the 3-day notice is a critical alert.
+    NotificationKind.CAPTURE_CREDENTIAL_WARNING,
 })
 # Kinds whose alert may be sent after the condition already ended: the text
 # then says so (Issue #349, a held camera outage that recovered first).
