@@ -315,6 +315,83 @@ class ExpiryCapTests(ExpiryFixture, unittest.TestCase):
         self.assertEqual(self.kinds(), [WARNING.value])
 
 
+class ExpiryUnreadableLedgerTests(ExpiryFixture, unittest.TestCase):
+    """PR #427 review: an owed notice waits for a readable tick to recheck it."""
+
+    def capped(self):
+        for _index in range(HOURLY_LIMIT):
+            self.monitor._window(self.node, self.clock.value).append(self.clock.value)
+
+    def held_warning(self):
+        self.capped()
+        self.expires_in(10 * DAY)
+        status = self.drain()
+        self.assertEqual((self.kinds(), status.held_notices), ([], 1))
+        # The cap frees on a tick whose ledger read failed: nothing is sent.
+        self.provider.expiries = None
+        self.advance(3600)
+        status = self.drain(AT + timedelta(hours=1))
+        self.assertEqual((self.kinds(), status.held_notices), ([], 1))
+
+    def held_recovery(self):
+        self.expires_in(10 * DAY)
+        self.drain()
+        self.capped()
+        self.provider.expiries = {self.node: (AT + timedelta(days=400)).timestamp()}
+        status = self.drain()
+        self.assertEqual((self.kinds(), status.held_notices), ([WARNING.value], 1))
+        self.provider.expiries = None
+        self.advance(3600)
+        status = self.drain(AT + timedelta(hours=1))
+        self.assertEqual((self.kinds(), status.held_notices), ([WARNING.value], 1))
+
+    def test_a_held_warning_still_valid_is_sent_on_the_next_readable_tick(self):
+        self.held_warning()
+        self.provider.expiries = {}
+        self.expires_in(10 * DAY)
+        self.drain(AT + timedelta(hours=1))
+        self.assertEqual(self.kinds(), [WARNING.value])
+
+    def test_a_held_warning_renewed_meanwhile_is_dropped(self):
+        self.held_warning()
+        self.provider.expiries = {self.node: (AT + timedelta(days=400)).timestamp()}
+        status = self.drain(AT + timedelta(hours=1))
+        self.assertEqual((self.kinds(), status.held_notices), ([], 0))
+
+    def test_a_held_warning_revoked_meanwhile_is_dropped(self):
+        self.held_warning()
+        self.provider.expiries = {}
+        status = self.drain(AT + timedelta(hours=1))
+        self.assertEqual((self.kinds(), status.held_notices), ([], 0))
+
+    def test_a_held_recovery_still_valid_is_sent_on_the_next_readable_tick(self):
+        self.held_recovery()
+        self.provider.expiries = {self.node: (AT + timedelta(days=400)).timestamp()}
+        self.drain(AT + timedelta(hours=1))
+        self.assertEqual(sorted(self.kinds()), sorted([WARNING.value, RECOVERED.value]))
+
+    def test_a_held_recovery_revoked_meanwhile_is_dropped(self):
+        self.held_recovery()
+        self.provider.expiries = {}
+        status = self.drain(AT + timedelta(hours=1))
+        self.assertEqual((self.kinds(), status.held_notices), ([WARNING.value], 0))
+
+    def test_a_held_recovery_back_inside_the_window_is_dropped(self):
+        # Replaced again by a credential within 14 days: no recovery, and
+        # the new credential gets its own warning.
+        self.held_recovery()
+        self.provider.expiries = {}
+        self.expires_in(5 * DAY, at=AT + timedelta(hours=1))
+        self.drain(AT + timedelta(hours=1))
+        self.assertEqual(self.kinds(), [WARNING.value, WARNING.value])
+
+    def test_other_notices_are_still_sent_while_the_ledger_is_unreadable(self):
+        self.held_warning()
+        self.provider.set(self.node, "degraded", "storage_unavailable")
+        self.drain(AT + timedelta(hours=1, seconds=1))
+        self.assertEqual(self.kinds(), [STORAGE.value])
+
+
 class ExpiryRestartTests(ExpiryFixture, unittest.TestCase):
 
     def restarted(self):

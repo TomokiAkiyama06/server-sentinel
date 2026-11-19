@@ -83,7 +83,9 @@ recorded is dropped instead, without a recovery. These share the per-node
 hourly cap above. A refused or unavailable renewal is never notified on its
 own (the listener status and the log keep it). A node that is revoked, or
 whose credential leaves the ledger's active set, drops its credential state
-without a notice; an unreadable ledger (``None``) pauses the evaluation.
+without a notice; an unreadable ledger (``None``) pauses the evaluation, and
+an owed credential notice is not delivered on such a tick: the next readable
+one rechecks it against the current credential first.
 
 Each credential notice belongs to one credential: its event ID is derived
 from the node and that credential's expiry (``credential_subject``) as well
@@ -311,6 +313,10 @@ class CaptureNodeHealthMonitor:
         self._credential_history: tuple[tuple[UUID, NotificationKind, datetime], ...] | None = None
         self._credential_seeded: set[UUID] = set()
         self._expiring = 0
+        # Whether this drain read the expiries and rechecked every owed
+        # credential notice against the current credential (PR #427 review):
+        # only then may one be delivered.
+        self._credential_checked = False
 
     def restore_window(self, rows, *, monotonic: float) -> None:
         """Re-seed the hour from ``(event ID, kind, UTC at, age seconds)`` of accepted rows.
@@ -407,7 +413,14 @@ class CaptureNodeHealthMonitor:
         used: set[UUID] = set()
         owed = [(key, episode, self._held) for key, episode in self._held.items()]
         owed += [(key, episode, self._episodes) for key, episode in self._episodes.items()]
-        owed += [(key, episode, self._credential) for key, episode in self._credential.items()]
+        if self._credential_checked:
+            owed += [(key, episode, self._credential)
+                     for key, episode in self._credential.items()]
+        else:
+            # Ledger unreadable (or not restored yet): still owed, but not
+            # sent until a readable tick rechecked it (the credential may
+            # have been renewed or revoked meanwhile).
+            held += sum(episode.due() for episode in self._credential.values())
         for key, episode, table in sorted(owed, key=lambda item: item[1].started):
             if not episode.due():
                 continue
@@ -580,10 +593,12 @@ class CaptureNodeHealthMonitor:
     def _observe_credentials(self, expiries: dict[UUID, float] | None, at: datetime,
                              now: float) -> None:
         """Issue #426: owe the notices a node's current credential expiry calls for."""
+        self._credential_checked = False
         if expiries is None or self._credential_history is None:
             # Ledger unreadable, or what was sent not restored yet: paused,
-            # owed notices kept.
+            # owed notices kept and not delivered (`drain`).
             return
+        self._credential_checked = True
         wall = at.timestamp()
         expiring = 0
         for node, not_after in expiries.items():
