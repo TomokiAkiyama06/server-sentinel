@@ -44,6 +44,13 @@ alert: a node with an active pairing credential sent no heartbeat for 5 min.
 presenting one node's credential replaced each other 3 times within 10 min, so
 more than one connection uses it (for example a cloned SD card or a restored
 backup); it names no host and claims no intent.
+The credential expiry kinds (Issue #426, Owner decision 2026-11-19) are
+immediate too: `capture_credential_warning` is an attention notice (14 days
+or less left on an active node's current certificate),
+`capture_credential_critical` a critical alert (3 days or less, or expired)
+and `capture_credential_recovered` a recovery notice (renewed after one of
+them was sent). They share the per-node hourly cap and never name a node,
+serial or expiry.
 The five node kinds accept `recovered=True` for a notice
 the per-node hourly cap held past the episode's end. No node, address or
 reason is in the text.

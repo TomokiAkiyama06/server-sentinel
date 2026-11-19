@@ -927,7 +927,8 @@ only by synthetic tests (`server/tests/test_release.py`,
     the credential expires, the node must re-pair. Block renewal (for example
     stop the Main) until the 14-day threshold and confirm the Owner sees a
     `capture_credential_warning`. *(the renewal over the ingest session is
-    step 19; the Owner warning still needs the monitor's application hook)*
+    step 19; the Owner notices are the credential expiry item of the
+    capture-node checklist, Issue #426)*
 15. Main listener certificate rotation (Issue #125), on a disposable
     deployment after step 7: record the listener `not_after`, run
     `sudo MAIN_CLI rotate-listener --authority-dir <ca_dir> --listener-dir <listener_dir>`
@@ -1216,6 +1217,18 @@ local record.
   copy: no recovery notice, and after 10 min a new contention is notified
   again (within the hourly cap). Revoke and re-pair if the copy cannot be
   removed;
+- [ ] credential expiry (Issue #426), on a disposable deployment only: pair a
+  node with a short explicit validity (for example 13 days) and keep its
+  renewal failing (for example the renewal signer socket stopped): within one
+  monitoring tick Slack receives one `ServerSentinel attention notice:
+  capture_credential_warning`, none for the refused renewals themselves, and
+  no second one after a Main restart. With 3 days or less left (a second
+  node paired with 2 days), one `ServerSentinel critical alert:
+  capture_credential_critical`. Let the renewal succeed (signer started
+  again): after the Agent reconnects with the renewed certificate, one
+  `ServerSentinel recovery notice: capture_credential_recovered`, and no
+  further one after a restart. A revoked node near expiry is never notified.
+  No text names a node, serial or expiry;
 - [ ] from the capture host, which is not on the Tailnet, a paired node's
   heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
   the ALPN, without a client certificate, with another deployment's

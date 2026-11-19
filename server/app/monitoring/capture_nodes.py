@@ -65,6 +65,52 @@ recorded as they happen. The notice says only that more than one connection
 presents the node's credential (for example two Agents from a cloned SD
 card or a restored backup), never which host or that either is malicious.
 
+Credential expiry (Issue #426, Owner decision 2026-11-19): the provider's
+optional fourth element maps every node whose pairing credential is active
+to the expiry (``not_after``, UTC epoch seconds) of that current credential,
+as the ledger records it (``pairing.active_credential_expiries_on``: set at
+activation, moved on the first admission of a renewed certificate). A staged
+renewal the Agent has not presented yet does not count: the certificate in
+use still expires. With ``CREDENTIAL_WARNING_SECONDS`` (14 days) or less
+left, the node sends one attention notice ``capture_credential_warning``;
+with ``CREDENTIAL_CRITICAL_SECONDS`` (3 days) or less left, or once expired,
+one critical ``capture_credential_critical`` (a node first seen inside 3 days
+sends only the critical one, and an owed warning the cap still holds is
+replaced by it). Once one of them was recorded and the expiry is again more
+than 14 days ahead (a renewal promoted, or the node re-paired), one
+``capture_credential_recovered`` follows; an owed notice that was never
+recorded is dropped instead, without a recovery. These share the per-node
+hourly cap above. A refused or unavailable renewal is never notified on its
+own (the listener status and the log keep it). A node that is revoked, or
+whose credential leaves the ledger's active set, drops its credential state
+without a notice; an unreadable ledger (``None``) pauses the evaluation, and
+an owed credential notice is not delivered on such a tick: the next readable
+one rechecks it against the current credential first.
+
+Each credential notice belongs to one credential: its event ID is derived
+from the node and that credential's expiry (``credential_subject``) as well
+as the kind and time, so the stored row binds it without naming either. A
+warning or critical is for the current credential; a recovery is for the
+credential the warning was for. A notice recorded for one credential never
+suppresses a notice for another (a node revoked and paired again under the
+same UUID starts afresh), and when the current credential changes while
+still within 14 days the new one gets its own notices, without a recovery.
+
+What was recorded survives a restart: ``restore_credential_notices`` is
+given the newest stored credential notice rows (any age the notification
+retention kept). A row applies to a node only if its event ID matches the
+node and its *current* credential's expiry; the latest such row says what
+was sent (a warning, a critical, or a recovery that closed it). Until it was
+called the expiry is not evaluated, so a restart never repeats a notice
+already sent for the current credential. A renewal is promoted by the
+running Main (the ingest listener admits the renewed certificate), so its
+recovery is owed in that process; one not yet recorded when the Main stops
+(the tick after the promotion, or held by the cap) is not sent after the
+restart, because the rows of the old credential no longer apply. The cap
+re-seeding matches credential rows against the node's current and last
+warned credential, so a row of an older credential within the hour is not
+counted (at most the three notices of a credential replaced within it).
+
 The listener: configured (state ``starting`` or ``unavailable``: material
 unreadable, bind being retried) but not ``running`` for 5 min sends one
 ``capture_ingest_unavailable`` per episode. ``disabled`` (no deployment
@@ -88,20 +134,32 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
-from typing import Callable, Iterable
+from typing import Callable
 from uuid import UUID, uuid5
 
 from app.notifications.service import DeliveryResult, NotificationKind, NotificationService
 
 
 NOTICE_AFTER_SECONDS = 300.0
+# Issue #426 (Owner decision 2026-11-19): time left on a node's current
+# credential at which it is notified (inclusive).
+CREDENTIAL_WARNING_SECONDS = 14 * 24 * 3600.0
+CREDENTIAL_CRITICAL_SECONDS = 3 * 24 * 3600.0
+_CREDENTIAL_WARNING = NotificationKind.CAPTURE_CREDENTIAL_WARNING
+_CREDENTIAL_CRITICAL = NotificationKind.CAPTURE_CREDENTIAL_CRITICAL
+_CREDENTIAL_RECOVERED = NotificationKind.CAPTURE_CREDENTIAL_RECOVERED
+CREDENTIAL_NOTICE_KINDS = (_CREDENTIAL_WARNING, _CREDENTIAL_CRITICAL, _CREDENTIAL_RECOVERED)
+# What a node's latest recorded credential notice leaves it at.
+_CREDENTIAL_LEVEL = {_CREDENTIAL_WARNING: 1, _CREDENTIAL_CRITICAL: 2, _CREDENTIAL_RECOVERED: 0}
 # The node notice kinds whose accepted rows re-seed the hourly cap.
 NODE_NOTICE_KINDS = (
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE,
     NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
     NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
-)
+) + CREDENTIAL_NOTICE_KINDS
+# How many stored credential notice rows a restart reads back (newest first).
+CREDENTIAL_HISTORY_ROWS = 256
 _LOST = NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST
 _CONTENTION = NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION
 HOURLY_LIMIT = 4
@@ -155,6 +213,9 @@ class CaptureHealthStatus:
     nodes_counted: bool = False
     # Issue #407: known nodes whose sessions keep replacing each other.
     contended_nodes: int = 0
+    # Issue #426: active nodes whose current credential has 14 days or less
+    # left (expired ones included).
+    expiring_credentials: int = 0
 
 
 def notice_id(kind: NotificationKind, node: object, at: datetime) -> UUID:
@@ -165,6 +226,15 @@ def notice_id(kind: NotificationKind, node: object, at: datetime) -> UUID:
     node the registry knows again without the row naming it.
     """
     return uuid5(_NAMESPACE, f"{kind.value}:{node}:{at.astimezone(timezone.utc).isoformat()}")
+
+
+def credential_subject(node: UUID, not_after: float) -> str:
+    """What a credential notice's ``notice_id`` is derived from (Issue #426).
+
+    The node and the expiry of the credential the notice is for, so a stored
+    row is bound to that credential without naming the node or the expiry.
+    """
+    return f"{node}@{round(not_after)}"
 
 
 @dataclass
@@ -184,6 +254,10 @@ class _Episode:
     # The first attempt's time and ID, kept for every retry of the same row.
     at: datetime | None = None
     event_id: UUID | None = None
+    # Issue #426: what the event ID is derived from instead of the node (a
+    # credential notice: `credential_subject`), and that credential's expiry.
+    subject: str | None = None
+    not_after: float | None = None
 
     def pause(self) -> None:
         self.observed = False
@@ -204,8 +278,11 @@ class _Episode:
 
 
 class CaptureNodeHealthMonitor:
-    def __init__(self, provider: Callable[[], tuple[str, Iterable[CaptureNodeView],
-                                                    Iterable[UUID] | None]], *,
+    # ``provider()`` returns ``(state, nodes, expected)`` or, with the
+    # credential expiry of Issue #426, ``(state, nodes, expected, expiries)``
+    # (``Iterable[CaptureNodeView]``, ``Iterable[UUID] | None`` and
+    # ``Mapping[UUID, float] | None``).
+    def __init__(self, provider: Callable[[], tuple], *,
                  after_seconds: float = NOTICE_AFTER_SECONDS, hourly_limit: int = HOURLY_LIMIT):
         if (not callable(provider) or type(after_seconds) not in (int, float)
                 or not math.isfinite(after_seconds) or after_seconds < 0
@@ -223,6 +300,23 @@ class CaptureNodeHealthMonitor:
         self._restored: list[tuple[float, UUID, NotificationKind, datetime]] = []
         # This process's own notices (bounded; only the restore reads it).
         self._own: deque[UUID] = deque(maxlen=256)
+        # Issue #426: owed credential notices by (node, kind), and per node
+        # the level of its latest recorded one (1 warning, 2 critical; a
+        # recorded recovery removes it). The stored rows of an earlier
+        # process, (event ID, kind, UTC at) newest first, seed a node the
+        # first time it is evaluated; None until restored.
+        self._credential: dict[tuple[UUID, NotificationKind], _Episode] = {}
+        # node -> (level, expiry of the credential it was recorded for)
+        self._credential_sent: dict[UUID, tuple[int, float]] = {}
+        # node -> its current credential's expiry, as last read.
+        self._credential_current: dict[UUID, float] = {}
+        self._credential_history: tuple[tuple[UUID, NotificationKind, datetime], ...] | None = None
+        self._credential_seeded: set[UUID] = set()
+        self._expiring = 0
+        # Whether this drain read the expiries and rechecked every owed
+        # credential notice against the current credential (PR #427 review):
+        # only then may one be delivered.
+        self._credential_checked = False
 
     def restore_window(self, rows, *, monotonic: float) -> None:
         """Re-seed the hour from ``(event ID, kind, UTC at, age seconds)`` of accepted rows.
@@ -244,20 +338,73 @@ class CaptureNodeHealthMonitor:
                           for event_id, kind, at, age in rows
                           if 0 <= age < _HOUR and event_id not in self._own]
 
+    def restore_credential_notices(self, rows) -> None:
+        """Seed what was sent from stored ``(event ID, kind, UTC at)`` credential rows.
+
+        Issue #426: given once (later calls change nothing), before the
+        expiry is first evaluated. A row counts for the node whose
+        ``notice_id`` it matches; for each node only its latest row matters.
+        """
+        rows = tuple(rows)
+        if any(type(row) is not tuple or len(row) != 3 or not isinstance(row[0], UUID)
+               or row[1] not in CREDENTIAL_NOTICE_KINDS or not isinstance(row[2], datetime)
+               or row[2].tzinfo is None for row in rows):
+            raise ValueError("invalid restored credential notices")
+        if self._credential_history is not None:
+            return
+        self._credential_history = tuple(sorted(rows, key=lambda row: row[2], reverse=True))[
+            :CREDENTIAL_HISTORY_ROWS]
+
+    @property
+    def credential_notices_restored(self) -> bool:
+        return self._credential_history is not None
+
+    def _credential_seed(self, node: UUID, not_after: float) -> int:
+        """The level recorded for ``node``'s credential expiring at ``not_after``."""
+        subject = credential_subject(node, not_after)
+        for event_id, kind, at in self._credential_history or ():
+            if notice_id(kind, subject, at) == event_id:
+                return _CREDENTIAL_LEVEL[kind]
+        return 0
+
     def _restored_for(self, node: UUID, now: float) -> int:
-        return sum(now - accepted < _HOUR and notice_id(kind, node, at) == event_id
-                   for accepted, event_id, kind, at in self._restored)
+        # Credential notices are bound to a credential: matched against the
+        # node's current one and the one it was last warned for.
+        subjects = {credential_subject(node, value) for value in (
+            self._credential_current.get(node),
+            (self._credential_sent.get(node) or (None, None))[1]) if value is not None}
+        count = 0
+        for accepted, event_id, kind, at in self._restored:
+            if now - accepted >= _HOUR:
+                continue
+            candidates = subjects if kind in CREDENTIAL_NOTICE_KINDS else (node,)
+            count += any(notice_id(kind, subject, at) == event_id for subject in candidates)
+        return count
 
     def drain(self, notifications: NotificationService, *, at: datetime,
               monotonic: float) -> CaptureHealthStatus:
         """Observe the provider once, then record every owed notice the cap allows."""
-        state, nodes, expected = self._provider()
+        provided = tuple(self._provider())
+        if len(provided) not in (3, 4):
+            raise ValueError("invalid capture node provider result")
+        state, nodes, expected = provided[:3]
+        expiries = provided[3] if len(provided) == 4 else None
         nodes = tuple(nodes)
         expected = None if expected is None else frozenset(expected)
+        if expiries is not None:
+            expiries = dict(expiries)
+            if any(not isinstance(node, UUID) or type(value) not in (int, float)
+                   or not math.isfinite(value) for node, value in expiries.items()):
+                raise ValueError("invalid credential expiry")
         self._observe_listener(state, at, monotonic)
-        self._observe_nodes(nodes, expected, at, monotonic)
+        # A node with a credential expiry keeps its hour (`_window`) as an
+        # expected node does.
+        self._observe_nodes(nodes, None if expected is None and expiries is None
+                            else (expected or frozenset()) | frozenset(expiries or ()),
+                            at, monotonic)
         self._observe_contention(nodes, at, monotonic)
         self._observe_loss(nodes, expected, state == "running", at, monotonic)
+        self._observe_credentials(expiries, at, monotonic)
         self._restored = [row for row in self._restored if monotonic - row[0] < _HOUR]
         held = 0
         # Event IDs given on this drain: a held (recovered) and a current
@@ -266,6 +413,14 @@ class CaptureNodeHealthMonitor:
         used: set[UUID] = set()
         owed = [(key, episode, self._held) for key, episode in self._held.items()]
         owed += [(key, episode, self._episodes) for key, episode in self._episodes.items()]
+        if self._credential_checked:
+            owed += [(key, episode, self._credential)
+                     for key, episode in self._credential.items()]
+        else:
+            # Ledger unreadable (or not restored yet): still owed, but not
+            # sent until a readable tick rechecked it (the credential may
+            # have been renewed or revoked meanwhile).
+            held += sum(episode.due() for episode in self._credential.values())
         for key, episode, table in sorted(owed, key=lambda item: item[1].started):
             if not episode.due():
                 continue
@@ -276,11 +431,12 @@ class CaptureNodeHealthMonitor:
                 held += 1
                 continue
             if episode.at is None:
+                subject = node if episode.subject is None else episode.subject
                 attempt = at
-                while notice_id(episode.kind, node, attempt) in used:
+                while notice_id(episode.kind, subject, attempt) in used:
                     attempt += timedelta(microseconds=1)
                 episode.at = attempt
-                episode.event_id = notice_id(episode.kind, node, attempt)
+                episode.event_id = notice_id(episode.kind, subject, attempt)
             used.add(episode.event_id)
             if not notifications.can_accept(episode.event_id):
                 # Queue full or closed: retried on the next drain.
@@ -301,6 +457,17 @@ class CaptureNodeHealthMonitor:
                 window.append(monotonic)
             if table is self._held:
                 del self._held[key]
+            elif table is self._credential:
+                # One-shot: what was recorded is kept per node instead.
+                del self._credential[key]
+                level = _CREDENTIAL_LEVEL[episode.kind]
+                prior = self._credential_sent.get(node)
+                if level:
+                    if prior is not None and prior[1] == episode.not_after:
+                        level = max(level, prior[0])
+                    self._credential_sent[node] = (level, episode.not_after)
+                elif prior is not None and prior[1] == episode.not_after:
+                    self._credential_sent.pop(node, None)
         seen = {node.node_id for node in nodes}
         return CaptureHealthStatus(
             online_nodes=sum(node.state == "online" for node in nodes),
@@ -320,7 +487,8 @@ class CaptureNodeHealthMonitor:
                                                       for view in nodes)),
             loss_watch_unavailable=expected is None and state == "running",
             nodes_counted=expected is not None,
-            contended_nodes=sum(node.contended for node in nodes))
+            contended_nodes=sum(node.contended for node in nodes),
+            expiring_credentials=self._expiring)
 
     # -- observation ---------------------------------------------------------
 
@@ -417,6 +585,80 @@ class CaptureNodeHealthMonitor:
                 # Forgotten by the registry (revoked, or dropped for room).
                 # Loss episodes follow the ledger (`_observe_loss`).
                 del table[key]
-        active = known | {key[0] for key in self._episodes} | {key[0] for key in self._held}
+        active = (known | {key[0] for key in self._episodes} | {key[0] for key in self._held}
+                  | {key[0] for key in self._credential} | set(self._credential_sent))
         for node in [node for node in self._sent if node not in active]:
             del self._sent[node]
+
+    def _observe_credentials(self, expiries: dict[UUID, float] | None, at: datetime,
+                             now: float) -> None:
+        """Issue #426: owe the notices a node's current credential expiry calls for."""
+        self._credential_checked = False
+        if expiries is None or self._credential_history is None:
+            # Ledger unreadable, or what was sent not restored yet: paused,
+            # owed notices kept and not delivered (`drain`).
+            return
+        self._credential_checked = True
+        wall = at.timestamp()
+        expiring = 0
+        for node, not_after in expiries.items():
+            self._credential_current[node] = not_after
+            if node not in self._credential_seeded:
+                # Only rows of this credential apply (a revoked one's do not).
+                self._credential_seeded.add(node)
+                level = self._credential_seed(node, not_after)
+                if level:
+                    self._credential_sent[node] = (level, not_after)
+            remaining = not_after - wall
+            level = (2 if remaining <= CREDENTIAL_CRITICAL_SECONDS
+                     else 1 if remaining <= CREDENTIAL_WARNING_SECONDS else 0)
+            for kind in (_CREDENTIAL_WARNING, _CREDENTIAL_CRITICAL):
+                owed = self._credential.get((node, kind))
+                if owed is not None and owed.not_after != not_after:
+                    # Owed for a credential that is no longer current.
+                    del self._credential[(node, kind)]
+            sent_level, sent_for = self._credential_sent.get(node, (0, None))
+            if level:
+                expiring += 1
+                # Inside the window again: a recovery not recorded yet is
+                # no longer true.
+                self._credential.pop((node, _CREDENTIAL_RECOVERED), None)
+                if sent_level and sent_for != not_after:
+                    # Replaced by another credential still within 14 days:
+                    # the new one has its own notices, and no recovery.
+                    del self._credential_sent[node]
+                    sent_level = 0
+                if level == 2 and sent_level < 2:
+                    # The critical notice supersedes a warning still owed.
+                    self._credential.pop((node, _CREDENTIAL_WARNING), None)
+                    self._owe_credential(node, _CREDENTIAL_CRITICAL, not_after, now)
+                elif level == 1 and sent_level < 1:
+                    self._owe_credential(node, _CREDENTIAL_WARNING, not_after, now)
+            else:
+                # Renewed (or re-paired): a notice never recorded is not
+                # sent late; one that was recorded is closed by one recovery,
+                # bound to the credential it was for.
+                self._credential.pop((node, _CREDENTIAL_WARNING), None)
+                self._credential.pop((node, _CREDENTIAL_CRITICAL), None)
+                if sent_level:
+                    self._owe_credential(node, _CREDENTIAL_RECOVERED, sent_for, now)
+        self._expiring = expiring
+        watched = ({key[0] for key in self._credential} | set(self._credential_sent)
+                   | self._credential_seeded | set(self._credential_current))
+        for node in watched - set(expiries):
+            # Revoked, superseded or no recorded expiry: not watched, and
+            # nothing about it is notified (no recovery either). A credential
+            # it is given later has another expiry, so its rows never apply.
+            for kind in CREDENTIAL_NOTICE_KINDS:
+                self._credential.pop((node, kind), None)
+            self._credential_sent.pop(node, None)
+            self._credential_current.pop(node, None)
+            self._credential_seeded.discard(node)
+
+    def _owe_credential(self, node: UUID, kind: NotificationKind, not_after: float,
+                        now: float) -> None:
+        key = (node, kind)
+        if key not in self._credential:
+            self._credential[key] = _Episode(
+                kind, 0.0, now, now, reached=True,
+                subject=credential_subject(node, not_after), not_after=not_after)

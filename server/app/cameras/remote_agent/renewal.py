@@ -21,8 +21,12 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
   stay per node) while never locking out an Agent that failed to receive or
   install the response: it keeps using the old certificate and retries.
 * ``CaptureCredentialMonitor`` turns ledger expiry state and renewal refusals
-  into Owner-visible local ``capture_credential_warning`` notifications through
-  an injected hook. A renewal refused because the deployment CA expires before
+  into ``capture_credential_warning`` notifications through an injected hook.
+  The application does not wire it (Owner decision 2026-11-19, Issue #426): a
+  single refused renewal is never notified, and the Owner's expiry notices
+  (warning at 14 days, critical at 3 days, one recovery) come from the
+  monitoring worker (``app.monitoring.capture_nodes``), which reads the
+  ledger's current expiry and shares the per-node hourly cap. A renewal refused because the deployment CA expires before
   the requested leaf would (``renewal_ca_validity_insufficient``, Issue #127)
   is not a node problem: it raises the deployment-wide
   ``capture_trust_warning`` instead, as do an expiring CA and an expiring Main
