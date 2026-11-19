@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from app.cameras.remote_agent.pairing import active_credential_expiries_on
 from app.monitoring.capture_nodes import (
     CREDENTIAL_CRITICAL_SECONDS, CREDENTIAL_NOTICE_KINDS, CREDENTIAL_WARNING_SECONDS,
-    HOURLY_LIMIT, NODE_NOTICE_KINDS, CaptureNodeHealthMonitor, notice_id,
+    HOURLY_LIMIT, NODE_NOTICE_KINDS, CaptureNodeHealthMonitor, credential_subject, notice_id,
 )
 from app.notifications.service import (
     ATTENTION_KINDS, IMMEDIATE_KINDS, RECOVERY_KINDS, NotificationKind,
@@ -282,14 +282,28 @@ class ExpiryCapTests(ExpiryFixture, unittest.TestCase):
         self.assertEqual(self.credential_kinds(), [CRITICAL.value])
 
     def test_restored_credential_rows_count_for_the_cap(self):
+        self.expires_in(10 * DAY)
+        subject = credential_subject(self.node, self.provider.expiries[self.node])
         rows = []
         for index in range(HOURLY_LIMIT):
             at = AT - timedelta(minutes=10 + index)
-            rows.append((notice_id(WARNING, self.node, at), WARNING, at, 600.0 + index))
+            rows.append((notice_id(WARNING, subject, at), WARNING, at, 600.0 + index))
+        self.monitor.restore_window(rows, monotonic=self.clock.value)
+        status = self.drain()
+        self.assertEqual((self.kinds(), status.held_notices), ([], 1))
+
+    def test_a_restored_row_of_another_credential_does_not_count(self):
+        # The cap matches credential rows against the current credential
+        # (and the one last warned for); an older credential's is not counted.
+        rows = []
+        for index in range(HOURLY_LIMIT):
+            at = AT - timedelta(minutes=10 + index)
+            old = credential_subject(self.node, AT.timestamp() + 5 * DAY)
+            rows.append((notice_id(WARNING, old, at), WARNING, at, 600.0 + index))
         self.monitor.restore_window(rows, monotonic=self.clock.value)
         self.expires_in(10 * DAY)
         status = self.drain()
-        self.assertEqual((self.kinds(), status.held_notices), ([], 1))
+        self.assertEqual((self.kinds(), status.held_notices), ([WARNING.value], 0))
 
     def test_a_full_queue_keeps_the_notice_owed(self):
         from unittest import mock
@@ -327,6 +341,9 @@ class ExpiryRestartTests(ExpiryFixture, unittest.TestCase):
         self.drain_with(monitor)
         self.assertEqual(self.kinds(), [WARNING.value])
 
+    def renewed(self, at):
+        self.provider.expiries[self.node] = (at + timedelta(days=397)).timestamp()
+
     def test_a_restart_does_not_repeat_a_warning_and_still_recovers(self):
         self.expires_in(10 * DAY)
         self.drain()
@@ -340,9 +357,8 @@ class ExpiryRestartTests(ExpiryFixture, unittest.TestCase):
         monitor = self.restarted()
         self.drain_with(monitor, AT + timedelta(days=7, hours=1))
         self.assertEqual(len(self.kinds()), 2)
-        # Renewed while the Main was stopped: one recovery after the start.
-        self.provider.expiries[self.node] = (AT + timedelta(days=400)).timestamp()
-        monitor = self.restarted()
+        # The running Main promotes the renewal: one recovery.
+        self.renewed(AT + timedelta(days=8))
         self.advance(3600)
         self.drain_with(monitor, AT + timedelta(days=8))
         self.drain_with(monitor, AT + timedelta(days=8, hours=1))
@@ -352,6 +368,65 @@ class ExpiryRestartTests(ExpiryFixture, unittest.TestCase):
         monitor = self.restarted()
         self.drain_with(monitor, AT + timedelta(days=9))
         self.assertEqual(len(self.kinds()), 3)
+
+    def test_rows_of_an_older_credential_do_not_apply_after_a_restart(self):
+        # Documented: a recovery not recorded before the stop is not sent
+        # after it (the old credential's rows no longer apply), and nothing
+        # is repeated for the renewed credential.
+        self.expires_in(10 * DAY)
+        self.drain()
+        self.renewed(AT)
+        monitor = self.restarted()
+        self.drain_with(monitor, AT + timedelta(hours=1))
+        self.assertEqual(self.kinds(), [WARNING.value])
+
+    def test_revoked_before_a_restart_then_repaired_gets_fresh_notices(self):
+        # PR #427 review (Codex P2): a node warned and then made critical is
+        # revoked, the Main restarts, and the same UUID is paired again with
+        # a short-lived certificate: the rows of the revoked credential do
+        # not suppress the new credential's notices.
+        self.expires_in(2 * DAY)
+        self.drain()
+        self.assertEqual(self.kinds(), [CRITICAL.value])
+        self.provider.expiries = {}
+        monitor = self.restarted()
+        self.drain_with(monitor, AT + timedelta(hours=1))
+        self.expires_in(10 * DAY, at=AT + timedelta(hours=2))
+        self.advance(3600)
+        self.drain_with(monitor, AT + timedelta(hours=2))
+        self.assertEqual(sorted(self.kinds()), sorted([CRITICAL.value, WARNING.value]))
+        self.drain_with(monitor, AT + timedelta(days=7, hours=2))
+        self.assertEqual(sorted(self.kinds()),
+                         sorted([CRITICAL.value, WARNING.value, CRITICAL.value]))
+        # And again after a further restart: nothing repeated, no recovery.
+        monitor = self.restarted()
+        self.drain_with(monitor, AT + timedelta(days=7, hours=3))
+        self.assertEqual(len(self.kinds()), 3)
+
+    def test_an_in_memory_cleanup_then_a_restart_still_gets_fresh_notices(self):
+        # Codex P2, second case: revoked while running (the cleanup), then
+        # restarted, then paired again under the same UUID.
+        self.expires_in(10 * DAY)
+        self.drain()
+        self.provider.expiries = {}
+        self.drain()
+        monitor = self.restarted()
+        self.drain_with(monitor, AT + timedelta(hours=1))
+        self.expires_in(2 * DAY, at=AT + timedelta(hours=2))
+        self.advance(3600)
+        self.drain_with(monitor, AT + timedelta(hours=2))
+        self.assertEqual(sorted(self.kinds()), sorted([WARNING.value, CRITICAL.value]))
+        monitor = self.restarted()
+        self.drain_with(monitor, AT + timedelta(hours=3))
+        self.assertEqual(len(self.kinds()), 2)
+
+    def test_a_new_credential_still_within_fourteen_days_has_its_own_notices(self):
+        self.expires_in(10 * DAY)
+        self.drain()
+        self.expires_in(12 * DAY, at=AT + timedelta(hours=1))
+        self.advance(3600)
+        self.drain(AT + timedelta(hours=1))
+        self.assertEqual(self.kinds(), [WARNING.value, WARNING.value])
 
     def test_a_node_that_left_the_active_set_is_not_seeded_again(self):
         self.expires_in(10 * DAY)
@@ -385,8 +460,9 @@ class ExpiryRestartTests(ExpiryFixture, unittest.TestCase):
             monitor.restore_credential_notices([(uuid4(), WARNING, AT.replace(tzinfo=None))])
         monitor.restore_credential_notices(())
         at = AT - timedelta(days=1)
-        monitor.restore_credential_notices([(notice_id(WARNING, self.node, at), WARNING, at)])
         self.expires_in(10 * DAY)
+        subject = credential_subject(self.node, self.provider.expiries[self.node])
+        monitor.restore_credential_notices([(notice_id(WARNING, subject, at), WARNING, at)])
         self.drain_with(monitor)
         self.assertEqual(self.kinds(), [WARNING.value])
 
@@ -449,7 +525,7 @@ class ExpiryRuntimeTests(RuntimeFixture):
                           monitoring_dependencies=MonitoringDependencies(**values),
                           capture_ingest_unavailable=True)
 
-    async def run_once(self, expiries):
+    async def run_once(self, expiries, then=None):
         application = self.app()
         async with application.router.lifespan_context(application):
             runtime = application.state.monitoring
@@ -462,13 +538,19 @@ class ExpiryRuntimeTests(RuntimeFixture):
             await runtime.call(runtime.tick)
             self.assertTrue(monitor.credential_notices_restored)
             await self.settle(runtime)
+            if then is not None:
+                # A renewal promoted by this running Main.
+                monitor._provider = lambda: ("running", (), frozenset(then), then)
+                self.clock.advance(timedelta(seconds=60))
+                await runtime.call(runtime.tick)
+                await self.settle(runtime)
 
     async def test_a_warning_is_sent_once_across_a_restart_and_recovers_once(self):
         node = uuid4()
         now = self.clock.utcnow()
         await self.run_once({node: (now + timedelta(days=10)).timestamp()})
-        await self.run_once({node: (now + timedelta(days=10)).timestamp()})
-        await self.run_once({node: (now + timedelta(days=400)).timestamp()})
+        await self.run_once({node: (now + timedelta(days=10)).timestamp()},
+                            then={node: (now + timedelta(days=400)).timestamp()})
         await self.run_once({node: (now + timedelta(days=400)).timestamp()})
         texts = [text for text in self.slack_texts() if "capture_credential" in text]
         self.assertEqual(texts, [

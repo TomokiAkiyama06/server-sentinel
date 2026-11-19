@@ -219,7 +219,10 @@ current `not_after` (`pairing.active_credential_expiries_on`, same
 connection); the first running tick reads the newest credential notice rows
 with the cap rows (`_credential_notice_rows` -> `restore_credential_notices`),
 and the expiry is not evaluated until it did, so a restart repeats no notice
-already sent. The daily
+already sent. A row applies only to the credential it was for (its event ID
+is derived from the node and that credential's expiry,
+`capture_nodes.credential_subject`), so a revoked and re-paired node starts
+afresh. The daily
 summary fills `agents_online` / `agents_offline` from its counts and shows them
 independently of the capture pipeline, as connection counts only, whenever the
 latest drain read the expected nodes (`nodes_counted`; otherwise
