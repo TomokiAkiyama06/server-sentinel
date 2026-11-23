@@ -350,8 +350,23 @@ def _installed_certificate(store: NodeCredentialStore) -> x509.Certificate:
         raise PairingRefused("node_identity_unavailable") from None
 
 
+def certificate_not_after(certificate: x509.Certificate) -> datetime.datetime:
+    """The certificate's notAfter as an aware UTC datetime.
+
+    ``not_valid_after_utc`` exists only from cryptography 42; the capture
+    host's OS package (Ubuntu 24.04 ``python3-cryptography`` 41, Owner
+    decision 2026-11-16) has only the naive ``not_valid_after``, which is
+    UTC. Looking the new name up first keeps newer releases free of the
+    naive attribute's deprecation warning.
+    """
+    value = getattr(certificate, "not_valid_after_utc", None)
+    if value is None:
+        value = certificate.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+    return value
+
+
 def installed_certificate_expiry(store: NodeCredentialStore) -> datetime.datetime:
-    return _installed_certificate(store).not_valid_after_utc
+    return certificate_not_after(_installed_certificate(store))
 
 
 def installed_private_key(store: NodeCredentialStore) -> ec.EllipticCurvePrivateKey:
@@ -431,7 +446,7 @@ def _complete_renewal_locked(store: NodeCredentialStore,
     try:
         node, certificate = _validate_leaf(credential.ca_certificate_pem, credential.deployment_id,
                                            key, certificate_pem)
-        if node != credential.node_id or certificate.not_valid_after_utc <= current_expiry:
+        if node != credential.node_id or certificate_not_after(certificate) <= current_expiry:
             raise ValueError
     except (ValueError, TypeError, InvalidSignature, x509.ExtensionNotFound):
         raise PairingRefused("renewed_credential_rejected") from None

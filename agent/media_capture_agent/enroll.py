@@ -65,7 +65,8 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from .node_tls import (
     DEPLOYMENT_URI_PREFIX, MAX_TRUST_BUNDLE_BYTES, PendingNodeKeyStore, TrustBundle,
-    build_capture_client_context, build_enrollment_request, connect_to_main,
+    build_capture_client_context, build_enrollment_request, certificate_not_after,
+    connect_to_main,
     installed_certificate_expiry, installed_credential, installed_private_key,
     public_key_digest, validate_issued_credential,
 )
@@ -355,7 +356,7 @@ def pair(runtime_root: Path, bundle: TrustBundle, *, host: str | None = None,
             return material.node_id
         if repair == REPAIR_EXPIRED:
             try:
-                expiry = x509.load_pem_x509_certificate(certificate).not_valid_after_utc
+                expiry = certificate_not_after(x509.load_pem_x509_certificate(certificate))
             except ValueError:
                 raise PairingRefused("issued_credential_rejected") from None
             if material.node_id != current.node_id or expiry <= max(previous_expiry, now()):

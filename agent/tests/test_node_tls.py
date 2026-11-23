@@ -1,4 +1,5 @@
 """Agent node key, enrollment request, trust pinning and real TLS client tests."""
+import datetime
 import io
 import json
 import logging
@@ -18,7 +19,8 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from media_capture_agent.node_tls import (
     RENEWAL_MAX_RETRY, PendingNodeKeyStore, RenewalSchedule, TrustBundle,
-    build_capture_client_context, build_enrollment_request, complete_renewal, connect_to_main,
+    build_capture_client_context, build_enrollment_request, certificate_not_after,
+    complete_renewal, connect_to_main,
     installed_certificate_expiry, installed_credential, prepare_renewal, public_key_digest,
     validate_issued_credential,
 )
@@ -379,6 +381,51 @@ class NodeRenewalTests(NodeTlsHarness):
                 complete_renewal(credentials, certificate)
         self.assertTrue((self.runtime / "pending-renewal" / "node-key.pem").exists())
         self.assertTrue(credentials.installed())
+
+
+class _Cryptography41Certificate:
+    """A certificate as cryptography 41 shows it: no ``not_valid_after_utc``.
+
+    Ubuntu 24.04's ``python3-cryptography`` (41) is what the capture host
+    runs (Owner decision 2026-11-16); the aware attribute came in 42.
+    """
+
+    def __init__(self, certificate):
+        self._certificate = certificate
+
+    def __getattr__(self, name):
+        if name == "not_valid_after_utc":
+            raise AttributeError(name)
+        if name == "not_valid_after":
+            aware = getattr(self._certificate, "not_valid_after_utc", None)
+            return (aware.replace(tzinfo=None) if aware is not None
+                    else self._certificate.not_valid_after)
+        return getattr(self._certificate, name)
+
+
+class CertificateNotAfterTests(NodeTlsHarness):
+    """notAfter works on cryptography 41 as well as on the pinned release."""
+
+    _installed = NodeRenewalTests._installed
+
+    def test_aware_utc_from_either_attribute(self):
+        credentials, _node = self._installed(lifetime=40 * DAY)
+        certificate = x509.load_pem_x509_certificate(
+            installed_credential(credentials).certificate_path.read_bytes())
+        expected = _Cryptography41Certificate(certificate).not_valid_after.replace(
+            tzinfo=datetime.timezone.utc)
+        for value in (certificate, _Cryptography41Certificate(certificate)):
+            result = certificate_not_after(value)
+            self.assertEqual(expected, result)
+            self.assertEqual(datetime.timezone.utc, result.tzinfo)
+
+    def test_installed_expiry_without_the_aware_attribute(self):
+        credentials, _node = self._installed(lifetime=40 * DAY)
+        expected = installed_certificate_expiry(credentials)
+        load = x509.load_pem_x509_certificate
+        with patch("media_capture_agent.node_tls.x509.load_pem_x509_certificate",
+                   lambda data: _Cryptography41Certificate(load(data))):
+            self.assertEqual(expected, installed_certificate_expiry(credentials))
 
 
 class AgentLockAuditTests(unittest.TestCase):
