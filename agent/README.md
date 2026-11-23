@@ -342,7 +342,10 @@ The service starts without it, but certificate renewal over the ingest
 session needs it (Issue #109); without it the status line shows
 `"renewal": "renewal_dependency_unavailable"` and the node must re-pair once
 its certificate expires. The OS package is the distribution's build, not the
-hash-pinned wheel of `requirements.lock`. Then the administrator may
+hash-pinned wheel of `requirements.lock`. The Agent reads certificate expiry through
+`node_tls.certificate_not_after`, so it also works with Ubuntu 24.04's
+`python3-cryptography` 41, which lacks the `not_valid_after_utc` attribute of
+cryptography 42 and later (2026-11-23: the first production start stopped there). Then the administrator may
 explicitly run:
 
 ```text
