@@ -270,6 +270,43 @@ class RecorderTests(RecorderCase):
         self.settle(5.0)
         self.assertTrue(self.ring.appended)
 
+    def test_no_ring_operation_runs_between_the_clock_read_and_the_append(self):
+        # PR #434 review: a heartbeat tick (or another source's append) that
+        # records a newer time between this finisher's clock read and its
+        # append made a healthy clock look rolled back.
+        self.ring.lock = threading.RLock()
+        order = []
+        started = threading.Event()
+
+        def tick():
+            started.set()
+            with self.ring.lock:
+                order.append("tick")
+
+        class Monitor(FakeMonitor):
+            def clock_trusted(monitor, utc, monotonic):
+                thread = threading.Thread(target=tick)
+                thread.start()
+                started.wait(5)
+                thread.join(0.2)  # blocked on the ring lock this finisher holds
+                order.append("tick blocked" if thread.is_alive() else "tick ran")
+                monitor.thread = thread
+                return True
+
+        monitor = Monitor()
+        self.recorder.monitor = monitor
+        original = self.ring.append
+
+        def append(*args, **kwargs):
+            order.append("append")
+            return original(*args, **kwargs)
+
+        self.ring.append = append
+        self.frames(0.0, 1.9)
+        self.settle(2.0)
+        monitor.thread.join(5)
+        self.assertEqual(order, ["tick blocked", "append", "tick"])
+
     def test_frames_out_of_order_are_ignored(self):
         self.recorder.feed(SECOND, JPEG)
         self.recorder.feed(SECOND // 2, JPEG)

@@ -177,7 +177,8 @@ class MonitorTests(unittest.TestCase):
         values = dict(clock_sample=(4999.0, 99.0), authenticated=True, connected=True,
                       lost=False, utc=5000.0, monotonic=100.0)
         values.update(changes)
-        return monitor.after_heartbeat(**values)
+        utc, monotonic = values.pop("utc"), values.pop("monotonic")
+        return monitor.after_heartbeat(utc=lambda: utc, monotonic=lambda: monotonic, **values)
 
     def test_an_unconfigured_ring_is_ticked_but_given_no_loss(self):
         ring = FakeRing()

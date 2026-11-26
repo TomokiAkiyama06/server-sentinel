@@ -45,6 +45,7 @@ from .frame_pacer import FramePacer, PacedFrame, PacedGap
 from .h264_annexb import AccessUnitSplitter, AnnexBError, validate_segment
 from .h264_encoder import EncoderProfile
 from .ring_models import SECOND, RingRefused
+from .ring_service import ring_lock
 from .uvc_pipeline import MjpegProfile, PipelineError
 
 
@@ -413,22 +414,26 @@ class SegmentRecorder:
         deadline = time.monotonic() + self.step_limit_us / SECOND + 1
         while int(self.utc() * SECOND) < segment.end_utc_us and time.monotonic() < deadline:
             time.sleep(0.05)
-        utc, monotonic = self.utc(), self.monotonic()
-        anchor_utc, anchor_mono = segment.anchor
-        if (abs((int(utc * SECOND) - anchor_utc) - (int(monotonic * SECOND) - anchor_mono))
-                > self.step_limit_us):
-            # The wall clock moved away from the mapping this segment's times
-            # come from: they may be wrong, so the segment is not stored even
-            # if the clock is trusted again now (PR #434 review).
-            self._count("segment_dropped_clock_remapped")
-            return
-        try:
-            self.ring.append(self.source_id, segment.start_utc_us, segment.end_utc_us, data,
-                             now_us=int(utc * SECOND),
-                             clock_trusted=self.monitor.clock_trusted(utc, monotonic))
-        except RingRefused as exc:
-            self._count("segment_refused_" + str(exc))
-            return
+        # The clock is read, judged and written under the ring's lock, so
+        # another source's append or the heartbeat's tick cannot record a
+        # newer time in between (PR #434 review).
+        with ring_lock(self.ring):
+            utc, monotonic = self.utc(), self.monotonic()
+            anchor_utc, anchor_mono = segment.anchor
+            if (abs((int(utc * SECOND) - anchor_utc) - (int(monotonic * SECOND) - anchor_mono))
+                    > self.step_limit_us):
+                # The wall clock moved away from the mapping this segment's
+                # times come from: they may be wrong, so the segment is not
+                # stored even if the clock is trusted again now (PR #434 review).
+                self._count("segment_dropped_clock_remapped")
+                return
+            try:
+                self.ring.append(self.source_id, segment.start_utc_us, segment.end_utc_us, data,
+                                 now_us=int(utc * SECOND),
+                                 clock_trusted=self.monitor.clock_trusted(utc, monotonic))
+            except RingRefused as exc:
+                self._count("segment_refused_" + str(exc))
+                return
         self._count("segments_stored")
 
     # -- status and shutdown ------------------------------------------------

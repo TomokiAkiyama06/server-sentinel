@@ -205,8 +205,7 @@ class Agent:
                       if clock.state == "online" else None)
             self.ring_status = self.ring.after_heartbeat(
                 clock_sample=sample, authenticated=bool(self.session.authenticated),
-                connected=connected, lost=lost,
-                utc=heartbeat["utc_seconds"], monotonic=heartbeat["monotonic_seconds"])
+                connected=connected, lost=lost, utc=self.utc, monotonic=self.monotonic)
         return heartbeat
 
     def close(self):
