@@ -192,6 +192,22 @@ class ProcessTests(unittest.TestCase):
             process.write(b"\xff" * (8 << 20), timeout=0.3)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_writes_that_keep_progressing_still_hit_the_timeout(self):
+        # PR #432 review: every attempt succeeds (no BlockingIOError), but
+        # slowly; the frame must still fail at its timeout.
+        process = self.process(SLOW_READER)
+        real_write = os.write
+
+        def slow_write(descriptor, data):
+            time.sleep(0.02)
+            return real_write(descriptor, bytes(data[:1]))
+
+        started = time.monotonic()
+        with mock.patch("media_capture_agent.h264_encoder.os.write", slow_write), \
+                self.assertRaisesRegex(PipelineError, "^video encoder stalled$"):
+            process.write(b"\xff" * 1000, timeout=0.1)
+        self.assertLess(time.monotonic() - started, 1)
+
     def test_an_exited_child_is_a_fixed_error(self):
         process = self.process("import sys\nsys.exit(0)\n")
         self.assertTrue(process.process.wait(10) == 0)

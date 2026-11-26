@@ -132,15 +132,16 @@ class EncoderProcess(SubprocessPipeline):
         try:
             descriptor = self._stdin.fileno()
             while view:
-                try:
-                    view = view[os.write(descriptor, view):]
-                    continue
-                except BlockingIOError:
-                    pass
+                # Checked before every attempt, so a child that keeps draining
+                # slowly cannot stretch one frame past the timeout either
+                # (PR #432 review).
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise PipelineError("video encoder stalled")
-                select.select([], [descriptor], [], remaining)
+                try:
+                    view = view[os.write(descriptor, view):]
+                except BlockingIOError:
+                    select.select([], [descriptor], [], remaining)
         except PipelineError:
             raise
         except (OSError, ValueError):
