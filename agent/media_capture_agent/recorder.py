@@ -27,7 +27,10 @@ it). The recorder thread turns frames into fixed-duration segments:
   missing interval as a gap. Nothing is recorded while the Owner has not
   configured the ring or its committed profiles differ from the deployment
   (no encoder runs then), and the mapping to UTC is re-established when the
-  wall clock departs from it by more than ``clock_step_limit_seconds``.
+  wall clock departs from it by more than ``clock_step_limit_seconds``; a
+  finished segment whose mapping no longer holds is not stored. An encoder
+  whose process group cannot be reaped is kept and retried, and no new
+  encoder starts until it is gone (as ``UvcCapture`` does for capture).
 
 No frame bytes are logged; counters and reason words are the only output.
 """
@@ -88,10 +91,6 @@ class _Encoder:
         self.process = process
         self.output = _Output(process, limit)
 
-    def discard(self):
-        self.process.stop(STOP_TIMEOUT_SECONDS)
-        self.process.close()
-
 
 class _Segment:
     def __init__(self, index, start_utc_us, start_mono_us, duration_us, frames, pacer):
@@ -103,6 +102,7 @@ class _Segment:
         self.encoder = None
         self.written = 0
         self.failure = None
+        self.anchor = None  # the (utc_us, mono_us) mapping its times come from
 
 
 class SegmentRecorder:
@@ -138,6 +138,10 @@ class SegmentRecorder:
         self._segment = None
         self._last = None          # (captured_mono_us, data) of the newest frame
         self._spare = None
+        # Encoders whose process group could not be reaped yet (PR #434
+        # review): retried, and no new encoder starts while one remains.
+        self._stuck = []
+        self._stuck_lock = threading.Lock()
         self._finish_inline = finish_inline
         self._finishing = deque()
         self._finisher = None
@@ -240,9 +244,13 @@ class SegmentRecorder:
                            max_hold_us=MAX_HOLD_US)
         segment = _Segment(index, start_utc, start_mono, self.segment_us,
                            self.frames_per_segment, pacer)
+        segment.anchor = self._anchor
         self._segment = segment
         if not self._ring_ready():
             segment.failure = "ring_not_ready"
+            self._discard_spare()
+        elif not self._reap_stuck():
+            segment.failure = "encoder_cleanup_pending"
             self._discard_spare()
         else:
             try:
@@ -272,7 +280,30 @@ class SegmentRecorder:
     def _discard_spare(self):
         spare, self._spare = self._spare, None
         if spare is not None:
-            spare.discard()
+            self._dispose(spare)
+
+    def _dispose(self, encoder, timeout=STOP_TIMEOUT_SECONDS):
+        """Stop an encoder; one that cannot be reaped is kept for retries."""
+        if encoder.process.stop(timeout):
+            encoder.process.close()
+            return
+        self._count("encoder_cleanup_pending")
+        with self._stuck_lock:
+            self._stuck.append(encoder)
+
+    def _reap_stuck(self):
+        """Retry the unreaped encoders; True when none remains."""
+        with self._stuck_lock:
+            stuck, self._stuck = self._stuck, []
+        remaining = []
+        for encoder in stuck:
+            if encoder.process.stop(0.1, wait=False):
+                encoder.process.close()
+            else:
+                remaining.append(encoder)
+        with self._stuck_lock:
+            self._stuck = remaining + self._stuck
+            return not self._stuck
 
     def _handle(self, outcomes):
         segment = self._segment
@@ -298,14 +329,14 @@ class SegmentRecorder:
         if segment.failure is None:
             segment.failure = reason
             if segment.encoder is not None:
-                segment.encoder.discard()
+                self._dispose(segment.encoder)
                 segment.encoder = None
 
     def _end(self, segment):
         if segment.failure is None and segment.written != segment.frames:
             self._fail(segment, "frame_gap")
         if segment.failure is not None:
-            if segment.failure != "ring_not_ready":
+            if segment.failure not in ("ring_not_ready", "encoder_cleanup_pending"):
                 self._count("segment_dropped_" + segment.failure)
             return
         if self._finish_inline:
@@ -320,7 +351,7 @@ class SegmentRecorder:
                 self._wake.notify_all()
         if backlog:
             self._count("segment_dropped_finish_backlog")
-            segment.encoder.discard()
+            self._dispose(segment.encoder)
             segment.encoder = None
 
     def _abandon(self, reason):
@@ -359,7 +390,7 @@ class SegmentRecorder:
                 reason = "encoder_failed"
         except Exception:  # noqa: BLE001
             reason = reason or "encoder_stalled"
-        encoder.discard()
+        self._dispose(encoder)
         if reason is not None:
             self._count("segment_dropped_" + reason)
             return
@@ -383,6 +414,14 @@ class SegmentRecorder:
         while int(self.utc() * SECOND) < segment.end_utc_us and time.monotonic() < deadline:
             time.sleep(0.05)
         utc, monotonic = self.utc(), self.monotonic()
+        anchor_utc, anchor_mono = segment.anchor
+        if (abs((int(utc * SECOND) - anchor_utc) - (int(monotonic * SECOND) - anchor_mono))
+                > self.step_limit_us):
+            # The wall clock moved away from the mapping this segment's times
+            # come from: they may be wrong, so the segment is not stored even
+            # if the clock is trusted again now (PR #434 review).
+            self._count("segment_dropped_clock_remapped")
+            return
         try:
             self.ring.append(self.source_id, segment.start_utc_us, segment.end_utc_us, data,
                              now_us=int(utc * SECOND),
@@ -406,7 +445,7 @@ class SegmentRecorder:
             self._thread.join(STOP_TIMEOUT_SECONDS + 1)
         segment, self._segment = self._segment, None
         if segment is not None and segment.encoder is not None:
-            segment.encoder.discard()
+            self._dispose(segment.encoder)
         self._discard_spare()
         with self._wake:
             self._producer_done = True
@@ -421,4 +460,5 @@ class SegmentRecorder:
         for segment in leftover:
             self._count("segment_dropped_shutdown")
             if segment.encoder is not None:
-                segment.encoder.discard()
+                self._dispose(segment.encoder)
+        self._reap_stuck()

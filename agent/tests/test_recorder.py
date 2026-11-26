@@ -229,10 +229,46 @@ class RecorderTests(RecorderCase):
         self.clock.offset += 10.0  # the wall clock steps 10 s forward
         self.frames(1.5, 4.5)
         self.settle(5.0)
-        self.assertEqual(self.recorder.status()["segment_dropped_clock_remapped"], 1)
+        # The segment in progress when the clock stepped ([1001, 1002)) is not
+        # stored with its old-mapping times (PR #434 review), and the next one
+        # begins under the new mapping.
+        self.assertEqual(self.recorder.status()["segment_dropped_clock_remapped"], 2)
         starts = [start for start, _end in self.stored()]
-        self.assertEqual(starts[0], 1001)
-        self.assertTrue(all(start >= 1012 for start in starts[1:]), starts)
+        self.assertTrue(starts)
+        self.assertTrue(all(start >= 1012 for start in starts), starts)
+
+    def test_an_unreaped_encoder_blocks_new_encoders_until_it_is_gone(self):
+        # PR #434 review: a process group that cannot be reaped is kept and
+        # retried; no replacement encoder starts meanwhile.
+        stuck = []
+        self.launcher.fail_writes = True
+
+        def stop(process, timeout, wait=True):
+            if process in stuck:
+                return False
+            process.stopped = True
+            return True
+
+        def launch(profile, original=self.launcher.launch):
+            process = original(profile)
+            process.stop = lambda timeout, wait=True, process=process: stop(process, timeout, wait)
+            if not self.launcher.launched[:-1]:
+                stuck.append(process)  # the first encoder never dies
+            return process
+
+        self.launcher.launch = launch
+        self.frames(0.0, 1.0)  # the first segment's encoder fails on write
+        self.launcher.fail_writes = False
+        launched = len(self.launcher.launched)
+        self.frames(1.0, 2.9)
+        self.settle(3.0)
+        self.assertEqual(self.recorder.status()["encoder_cleanup_pending"], 1)
+        self.assertEqual(self.ring.appended, [])
+        self.assertLessEqual(len(self.launcher.launched), launched)
+        stuck.clear()  # the process group is finally gone
+        self.frames(3.0, 4.9)
+        self.settle(5.0)
+        self.assertTrue(self.ring.appended)
 
     def test_frames_out_of_order_are_ignored(self):
         self.recorder.feed(SECOND, JPEG)
