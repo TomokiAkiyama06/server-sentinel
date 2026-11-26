@@ -74,7 +74,48 @@ Known limits:
   reports `ring_reconfiguration_required`.
 - The ring state appears only in the local status line (`"ring"`). A summary
   in the heartbeat to the Main waits for PR E.
-- Nothing is appended yet: the recorder that feeds encoded segments is PR C2.
+- Until PR C2, nothing was appended to the ring.
+
+## Recording (Issue #16 PR C2)
+
+`recorder.SegmentRecorder` (one per source) receives every capture frame from
+`PreviewTap` through a bounded, non-blocking queue. When the queue is full it
+drops the oldest frame and counts the drop.
+
+- **Segment grid.** Boundaries are multiples of `segment_seconds` in UTC. The
+  monotonic clock is mapped to UTC at start, after an interruption, and
+  whenever the wall clock departs from the mapping by more than
+  `clock_step_limit_seconds`; a remap drops the current interval. Each
+  segment's `fps × segment_seconds` slots start exactly at its boundary
+  (`frame_pacer`). A camera that delivers too slowly repeats frames; one that
+  delivers too fast has frames dropped; a frame older than 1 s is never
+  stretched over a slot, so the segment has a gap instead.
+- **Encoding.** Each segment has its own sandboxed OpenH264 child, so every
+  segment starts with an IDR picture. The next segment's child is started one
+  segment early.
+- **Finishing.** After the last picture, a finisher thread reads the Annex B
+  output (bounded by the profile's segment bytes) and checks it
+  (`validate_segment`). It writes one fMP4 (90 kHz timescale; the capture rate
+  must divide 90000) and appends it with the segment's UTC interval and
+  `RingMonitor.clock_trusted`.
+- **Dropped segments.** A segment is dropped, and counted under a fixed reason
+  word, when any of these happen:
+  - a gap
+  - an encoder that fails, stalls or is unavailable
+  - an invalid stream
+  - output beyond the bound
+  - a ring refusal
+
+  Only that interval is lost, and the ring reports it as a gap.
+- **Idle states.** No encoder runs while the ring is unconfigured or its
+  profiles differ from the deployment.
+- **Status.** The local status line's `"recording"` object sums these
+  counters over the sources.
+
+The real-encoder path (sandboxed OpenH264 into a temporary-filesystem
+`DiskRing`, on a `videotestsrc` pattern) is tested in the Ubuntu 24.04 apt CI
+job. CPU load and real-scene bitrate on the capture host are measured on the
+real host.
 
 ## Inputs and control boundary
 

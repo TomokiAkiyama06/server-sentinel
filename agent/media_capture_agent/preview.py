@@ -39,11 +39,18 @@ class PreviewFrame:
 
 class PreviewTap:
     def __init__(self, queues: Iterable[tuple[UUID, object]], *,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 listeners: dict | None = None):
         queues = tuple(queues)
         if any(not isinstance(source, UUID) or not callable(getattr(queue, "get", None))
                for source, queue in queues):
             raise ValueError("invalid preview queues")
+        # Issue #16: per source, a callable that also receives every frame
+        # (the ring recorder). It must not block; it gets the capture frame.
+        listeners = dict(listeners or {})
+        if any(not callable(listener) for listener in listeners.values()):
+            raise ValueError("invalid preview listener")
+        self._listeners = listeners
         self._clock = clock
         self._lock = threading.Lock()
         self._latest: dict[UUID, PreviewFrame] = {}
@@ -80,6 +87,13 @@ class PreviewTap:
             if (not isinstance(data, bytes) or not data or type(sequence) is not int
                     or type(generation) is not int):
                 continue
+            listener = self._listeners.get(source)
+            if listener is not None:
+                try:
+                    listener(frame)
+                except Exception:
+                    # The recorder reports its own failures; the preview goes on.
+                    pass
             kept = PreviewFrame(source, data, sequence, self._clock(), generation)
             with self._lock:
                 self._latest[source] = kept

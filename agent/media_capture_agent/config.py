@@ -199,6 +199,10 @@ class RingSettings:
         if not isinstance(sources, list):
             raise ConfigurationError("ring sources must be a list")
         parsed = []
+        if any(RING_TIMESCALE % source.fps for source in capture.sources):
+            # Every sample of a segment lasts exactly 1/fps in the MP4 track's
+            # 90 kHz timescale (Issue #16 PR C2).
+            raise ConfigurationError("ring requires a capture rate that divides 90000")
         frames = {source.source_id: source.fps * value["segment_seconds"]
                   for source in capture.sources}
         for source in sources:
@@ -237,6 +241,7 @@ class RingSettings:
 # Ring limits (Issue #16): the ring core accepts segments of at most PRE
 # (600 s); the clock holdover is bounded to one day; 100 Mbps per source.
 MAXIMUM_SEGMENT_SECONDS = 600
+RING_TIMESCALE = 90000
 MAXIMUM_CLOCK_HOLDOVER_SECONDS = 86400
 MAXIMUM_RING_BITRATE = 100_000_000
 
