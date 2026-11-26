@@ -45,6 +45,11 @@ _AU_START_TYPES = frozenset({NAL_SEI, NAL_SPS, NAL_PPS, NAL_AUD, 14, 15, 16, 17,
 # Profiles whose SPS carries chroma format and bit depth (7.3.2.1.1).
 _HIGH_PROFILES = frozenset({100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135})
 _START_CODE = b"\x00\x00\x01"
+# Zero bytes the splitter keeps pending at the end of its buffer: a NAL's
+# trailing_zero_8bits, a four-byte start code's zero_byte and the first two
+# bytes of the next start code. An encoder emits a handful; a longer run is
+# refused instead of growing without bound.
+MAX_ZERO_RUN = 4096
 _MAX_EXP_GOLOMB_ZEROS = 31
 
 SYNC_SAMPLE_FLAGS = 0x02000000
@@ -158,9 +163,14 @@ class AccessUnitSplitter:
         while True:
             end = self._buffer.find(_START_CODE)
             if end < 0:
-                # The pending NAL keeps growing; two bytes may still begin
-                # the next start code.
-                if len(self._buffer) - 2 > self.max_nal_bytes:
+                # The pending NAL keeps growing. Its trailing zero bytes may
+                # still be a zero_byte/trailing_zero_8bits plus the start of
+                # the next start code, so they do not count toward the NAL
+                # bound (PR #431 review); their run has its own bound.
+                zeros = _trailing_zeros(self._buffer, MAX_ZERO_RUN + 1)
+                if zeros > MAX_ZERO_RUN:
+                    raise AnnexBError("zero_byte_run_too_long")
+                if len(self._buffer) - zeros > self.max_nal_bytes:
                     raise AnnexBError("nal_unit_too_large")
                 return done
             data = bytes(self._buffer[:end]).rstrip(b"\x00")
@@ -195,6 +205,16 @@ class AccessUnitSplitter:
         unit = AccessUnit(tuple(self._current))
         self._current, self._current_size, self._has_vcl = [], 0, False
         return unit
+
+
+def _trailing_zeros(buffer, limit: int) -> int:
+    """Count trailing 0x00 bytes of ``buffer``, stopping at ``limit``."""
+    count = 0
+    index = len(buffer) - 1
+    while index >= 0 and count < limit and buffer[index] == 0:
+        count += 1
+        index -= 1
+    return count
 
 
 def _nal_or_skip(data: bytes) -> NalUnit | None:

@@ -203,6 +203,27 @@ class SplitterTests(unittest.TestCase):
             splitter.feed(annexb(SPS, PPS, idr(size=40), slice_()))
         self.assertEqual(caught.exception.reason, "access_unit_too_large")
 
+    def test_a_nal_at_the_bound_survives_any_chunk_boundary(self):
+        # PR #431 review: a chunk ending inside the next four-byte start code
+        # (after "00 00 00", before "01") must not count those zeros.
+        nal = idr(size=30)  # 32 bytes
+        data = annexb(nal, slice_(), four=True)
+        for split_at in range(len(data) + 1):
+            splitter = AccessUnitSplitter(max_nal_bytes=len(nal), max_access_unit_bytes=1 << 10)
+            with self.subTest(split_at=split_at):
+                units = splitter.feed(data[:split_at]) + splitter.feed(data[split_at:])
+                units += splitter.flush()
+                self.assertEqual([[n.data for n in unit.nals] for unit in units],
+                                 [[nal], [slice_()]])
+
+    def test_zero_byte_runs_are_bounded(self):
+        splitter = AccessUnitSplitter(max_nal_bytes=64, max_access_unit_bytes=1 << 10)
+        splitter.feed(b"\x00\x00\x01" + idr(size=10))
+        with self.assertRaises(AnnexBError) as caught:
+            for _ in range(10):
+                splitter.feed(bytes(1024))
+        self.assertEqual(caught.exception.reason, "zero_byte_run_too_long")
+
     def test_pending_bytes_stay_bounded_without_a_start_code(self):
         splitter = AccessUnitSplitter(max_nal_bytes=100, max_access_unit_bytes=1 << 10)
         splitter.feed(b"\x00\x00\x01")
