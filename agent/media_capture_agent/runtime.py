@@ -82,7 +82,7 @@ class UnconfiguredIngestSession(UnpairedSession):
 
 
 class Agent:
-    def __init__(self, settings, store, *, capture=None, session=None,
+    def __init__(self, settings, store, *, capture=None, session=None, ring=None,
                  utc=time.time, monotonic=time.monotonic):
         if os.geteuid() == 0 or os.geteuid() != settings.service_uid:
             raise StorageRefused("dedicated_nonroot_account_required")
@@ -110,6 +110,10 @@ class Agent:
         self.store = store
         self.capture = capture or UnconfiguredCapture()
         self.session = session or UnpairedSession()
+        # Issue #16: an optional ``ring_service.RingMonitor``; its state after
+        # each tick is ``ring_status`` (local status only, not the heartbeat).
+        self.ring = ring
+        self.ring_status = None
         self.utc = utc
         self.monotonic = monotonic
         self.sequence = 0
@@ -168,6 +172,7 @@ class Agent:
             "node_reasons": reasons, "clock": asdict(clock), "storage": storage,
             "sources": [source.public() for source in sources],
         }
+        connected = False
         if self.session.authenticated:
             try:
                 self.session.send_heartbeat(heartbeat)
@@ -176,11 +181,19 @@ class Agent:
                 if "main_unavailable" not in reasons:
                     reasons.append("main_unavailable")
             else:
+                connected = True
                 if exchange is None:
                     try:
                         self.clock_refresh_due = self.session.exchange_clock() is not None
                     except (ConnectionError, TimeoutError, OSError):
                         pass
+        if self.ring is not None:
+            # Issue #16: a session that was up and is now down is the loss
+            # (T0) that protects 10 minutes on each side of it.
+            self.ring_status = self.ring.after_heartbeat(
+                clock_online=clock.state == "online",
+                authenticated=bool(self.session.authenticated), connected=connected,
+                utc=heartbeat["utc_seconds"], monotonic=heartbeat["monotonic_seconds"])
         return heartbeat
 
     def close(self):
@@ -190,4 +203,8 @@ class Agent:
             try:
                 self.session.close()
             finally:
-                self.store.close()
+                try:
+                    if self.ring is not None:
+                        self.ring.ring.close()
+                finally:
+                    self.store.close()
