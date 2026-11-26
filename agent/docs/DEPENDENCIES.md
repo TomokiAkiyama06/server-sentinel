@@ -94,3 +94,38 @@ additional plugins/libraries under other terms; the deployment chooses and
 reviews the installed package set. Adopting GStreamer as the production capture
 runtime, and any future bundling, requires the Owner decision recorded in the
 introducing PR and inventory review before the adapter is wired into production.
+
+## Operator-installed OpenH264 encoder (Issue #16 ring, not bundled)
+
+Owner decision 2026-11-26 (`docs/decisions/2026-11-26-agent-ring-h264.md`):
+the ring stores H.264 encoded by OpenH264. `media_capture_agent/h264_encoder.py`
+runs the operator-installed `gst-launch-1.0` as a second, deviceless child per
+source. Like the capture child, it does not import, link, bundle, download or
+redistribute GStreamer or OpenH264.
+
+- **Elements:** `fdsrc`/`fdsink` (core), `jpegparse` (gst-plugins-bad
+  `jpegformat`), `jpegdec` (gst-plugins-good `jpeg`), `videoconvert`
+  (gst-plugins-base `videoconvertscale`) and `openh264enc` (gst-plugins-bad
+  `openh264`).
+- **Plugin files:** only those five can load. They must be root-controlled,
+  as must the executable, interpreter and sandbox helper.
+- **Sandbox:** the child runs under `uvc_sandbox --no-device`, so it can open
+  no device node.
+- **Packages:** on Debian/Ubuntu the encoder comes from `gstreamer1.0-plugins-bad`
+  and its dependency `libopenh264-7`. Ubuntu 24.04's package is OpenH264 2.4.1
+  built by the distribution from source.
+- **Licenses:**
+  - OpenH264 is BSD-2-Clause (https://github.com/cisco/openh264/blob/master/LICENSE).
+  - gst-plugins-bad and gst-plugins-base are LGPL-2.1-or-later
+    (https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gst-plugins-bad/COPYING).
+  - Running unmodified distribution packages as a separate program places no
+    license obligation on Agent code.
+- **Not used:** x264 (GPL), FFmpeg/libav (GPL audit) and NVENC.
+- **Patent licence:** Cisco's royalty-free H.264 patent licence covers Cisco's
+  prebuilt OpenH264 binaries, not a distribution's source build. The
+  deployment reviews that difference before installing.
+- **Production install:** installing these packages on a production capture
+  host is a separate, Owner-confirmed step.
+- **CI:** the "Ubuntu 24.04 apt packages" job installs them on the runner
+  (CI only) and runs the real-encoder test on a synthetic `videotestsrc`
+  pattern.

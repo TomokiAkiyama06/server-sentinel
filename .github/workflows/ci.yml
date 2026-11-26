@@ -241,12 +241,15 @@ jobs:
           "${RUNNER_TEMP}/agent-313/bin/python" -m unittest discover -s tests -p 'test_*.py' -v
 
   agent-ubuntu-2404-apt:
-    name: Agent unit tests on Ubuntu 24.04 apt python3-cryptography
+    name: Agent unit tests on Ubuntu 24.04 apt packages
     # Issue #428: a capture host on Ubuntu 24.04 runs the Agent with the apt
     # python3 (3.12) and python3-cryptography (41.x), not the hash-pinned wheel
     # lock, so an API newer than 41 must fail CI rather than the production
     # Agent. The runner is Ubuntu 24.04; its system interpreter imports the
     # distribution package, and the job fails if another build is imported.
+    # Issue #16 PR B: the same job installs the distribution GStreamer and
+    # OpenH264 plugins a capture host uses, and AGENT_OPENH264_REQUIRED=1 makes
+    # the real (synthetic test pattern) encoder test fail instead of skip.
     needs: repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -254,10 +257,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Install the distribution python3-cryptography
+      - name: Install the distribution python3-cryptography, GStreamer and OpenH264
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends python3-cryptography
+          sudo apt-get install --yes --no-install-recommends python3-cryptography \
+            gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad libopenh264-7
       - name: Require the distribution Python 3.12 and cryptography 41
         run: |
           /usr/bin/python3 -s -c '
@@ -271,6 +276,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONFAULTHANDLER: '1'
+          AGENT_OPENH264_REQUIRED: '1'
         run: /usr/bin/python3 -s -m unittest discover -s tests -p 'test_*.py' -v
 
   ci:
