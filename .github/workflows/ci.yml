@@ -240,10 +240,41 @@ jobs:
           "${RUNNER_TEMP}/agent-313/bin/python" -m pyflakes media_capture_agent tests build_artifact.py install.py
           "${RUNNER_TEMP}/agent-313/bin/python" -m unittest discover -s tests -p 'test_*.py' -v
 
+  agent-ubuntu-2404-apt:
+    name: Agent unit tests on Ubuntu 24.04 apt python3-cryptography
+    # Issue #428: a capture host on Ubuntu 24.04 runs the Agent with the apt
+    # python3 (3.12) and python3-cryptography (41.x), not the hash-pinned wheel
+    # lock, so an API newer than 41 must fail CI rather than the production
+    # Agent. The image holds only those distribution packages; the checkout is
+    # mounted read-only so the tests see the repository layout.
+    needs: repository
+    runs-on: ubuntu-24.04
+    # Includes building the image (base image pull and apt install).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build the pinned Ubuntu 24.04 apt image
+        run: docker build --file agent/Dockerfile.ubuntu2404-apt --tag agent-ubuntu-2404-apt agent
+      - name: Require the distribution Python 3.12 and cryptography 41
+        run: |
+          docker run --rm --pull=never --network=none agent-ubuntu-2404-apt python3 -c '
+          import sys, cryptography
+          print(sys.version, cryptography.__version__)
+          sys.exit(sys.version_info[:2] != (3, 12) or cryptography.__version__.split(".")[0] != "41")'
+      - name: Agent unit tests against the apt packages
+        run: |
+          docker run --rm --pull=never --network=none \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --volume "${GITHUB_WORKSPACE}:/src:ro" --workdir /src/agent \
+            agent-ubuntu-2404-apt \
+            python3 -m unittest discover -s tests -p 'test_*.py' -v
+
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [repository, components, agent-ring-sqlite-340, web-browser, agent-python-313]
+    needs: [repository, components, agent-ring-sqlite-340, web-browser, agent-python-313, agent-ubuntu-2404-apt]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -254,9 +285,11 @@ jobs:
           AGENT_RING_SQLITE_340_RESULT: ${{ needs.agent-ring-sqlite-340.result }}
           WEB_BROWSER_RESULT: ${{ needs.web-browser.result }}
           AGENT_PYTHON_313_RESULT: ${{ needs.agent-python-313.result }}
+          AGENT_UBUNTU_2404_APT_RESULT: ${{ needs.agent-ubuntu-2404-apt.result }}
         run: |
           test "$REPOSITORY_RESULT" = success
           test "$COMPONENT_RESULT" = success
           test "$AGENT_RING_SQLITE_340_RESULT" = success
           test "$WEB_BROWSER_RESULT" = success
           test "$AGENT_PYTHON_313_RESULT" = success
+          test "$AGENT_UBUNTU_2404_APT_RESULT" = success

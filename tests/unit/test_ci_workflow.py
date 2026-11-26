@@ -124,7 +124,7 @@ class CIWorkflowTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         start = workflow.find("\n  agent-python-313:\n")
         self.assertNotEqual(-1, start, "CPython 3.13 Agent job is missing")
-        end = workflow.find("\n  ci:\n", start)
+        end = workflow.find("\n  agent-ubuntu-2404-apt:\n", start)
         self.assertNotEqual(-1, end)
         job = workflow[start:end]
         self.assertIn("\n          python-version: '3.13'\n", job)
@@ -148,6 +148,37 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertNotEqual(-1, tests, "Agent unit tests do not run on 3.13")
         self.assertEqual(sorted(steps + [tests]), steps + [tests])
         self.assertIn("\n        working-directory: agent\n", job)
+
+    def test_agent_tests_run_against_ubuntu_2404_apt_cryptography(self):
+        # Issue #428: a capture host runs the Agent with Ubuntu 24.04's apt
+        # python3-cryptography 41, which lacks APIs of the pinned wheel. All
+        # Agent unit tests must run against it, and the job must fail rather
+        # than silently test another Python or cryptography version.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        start = workflow.find("\n  agent-ubuntu-2404-apt:\n")
+        self.assertNotEqual(-1, start, "Ubuntu 24.04 apt Agent job is missing")
+        end = workflow.find("\n  ci:\n", start)
+        self.assertNotEqual(-1, end)
+        job = workflow[start:end]
+        build = job.find("docker build --file agent/Dockerfile.ubuntu2404-apt"
+                         " --tag agent-ubuntu-2404-apt agent\n")
+        versions = job.find("sys.exit(sys.version_info[:2] != (3, 12)"
+                            " or cryptography.__version__.split(\".\")[0] != \"41\")")
+        tests = job.find("python3 -m unittest discover -s tests -p 'test_*.py' -v\n")
+        self.assertNotEqual(-1, build, "the apt image is not built")
+        self.assertNotEqual(-1, versions, "Python/cryptography versions are not enforced")
+        self.assertNotEqual(-1, tests, "Agent unit tests do not run on the apt packages")
+        self.assertLess(build, versions)
+        self.assertLess(versions, tests)
+        self.assertEqual(2, job.count("--network=none"))
+        self.assertIn('--volume "${GITHUB_WORKSPACE}:/src:ro" --workdir /src/agent', job)
+        dockerfile = (ROOT / "agent/Dockerfile.ubuntu2404-apt").read_text(encoding="utf-8")
+        self.assertRegex(dockerfile, r"\nFROM ubuntu:24\.04@sha256:[0-9a-f]{64}\n")
+        self.assertIn("apt-get install --yes --no-install-recommends python3 python3-cryptography", dockerfile)
+        # Nothing from the build context enters the image (agent/.dockerignore
+        # is an allow-list for Dockerfile.ci; this image takes the mount only).
+        self.assertNotRegex(dockerfile, r"(?m)^(COPY|ADD) ")
+        self.assertRegex(dockerfile, r"(?m)^USER 65534:65534$")
 
     def test_aggregate_ci_gate_requires_every_other_job_to_succeed(self):
         # The ruleset requires only the terminal `CI` check, so every other job
