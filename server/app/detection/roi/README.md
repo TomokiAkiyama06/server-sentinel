@@ -114,8 +114,19 @@ remain armed in every presence state.
 builds when the embedder passes `scene_monitoring` (a
 `SceneMonitoringConfiguration` of 1 to 4 `SceneSourceBinding`s). Local UVC
 frames reach it through the same frame and camera-state callbacks as the
-preview hub; a source whose frames are decoded elsewhere (a future
-remote-agent decoder) uses `offer_luma()` with the same pipeline. Capture
+preview hub.
+
+A `remote_agent` source bound with `MjpgLumaLayout` (Issue #205) receives
+the Agent's live JPEGs from the capture ingest `RemotePreviewHub` through its
+listener (`on_remote_frame`). The same reviewed MJPG decoder child decodes
+them. A new ingest session of the node starts a new stream. The session's
+end (`on_remote_stream_end`) is an **untrusted** loss: a network loss cannot
+be told from a cable pulled at the camera, so it ends a confirmation in
+progress and never confirms tamper by itself. `on_uvc_frame` takes only
+local sources and `on_remote_frame` only remote ones.
+
+A source whose frames are decoded elsewhere uses `offer_luma()` with the same
+pipeline. Capture
 threads only make a sampling decision and hold at most one pending sample per
 source; a newer sample replaces it and the replacement is counted. Decoding,
 the two detector-specific `QualityGate`s (`server_roi` for movement,
@@ -537,7 +548,9 @@ Synthetic verification: `server/tests/test_scene_calibration.py` (runtime
 acquisition, history, service, and the application lifespan with an
 intercepted Slack transport) and `server/tests/test_scene_calibration_routes.py`
 (the Owner routes). The production launcher does not build scene monitoring
-yet (the deployment section, including the templates, is a follow-up).
+yet. A follow-up adds the deployment section (bindings, quality policies and
+templates); it needs thresholds measured on the real cameras and the Owner's
+ROI polygons (#205, #22).
 
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,
