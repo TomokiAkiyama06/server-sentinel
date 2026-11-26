@@ -296,8 +296,12 @@ class SceneSourceBinding:
             raise ValueError("invalid capture layout")
         if self.source_type is SourceType.LOCAL_UVC and self.layout is None:
             raise ValueError("local UVC scene detection requires its capture layout")
-        if self.source_type is SourceType.REMOTE_AGENT and self.layout is not None:
-            raise ValueError("remote agent samples arrive decoded")
+        if (self.source_type is SourceType.REMOTE_AGENT and self.layout is not None
+                and not isinstance(self.layout, MjpgLumaLayout)):
+            # Issue #205: a remote agent's live JPEGs go through the same
+            # reviewed MJPG decoder child as local MJPG frames; a producer
+            # that decodes elsewhere uses `offer_luma` (no layout).
+            raise ValueError("remote agent frames are MJPG or arrive decoded")
         if type(self.sample_interval_ns) is not int or self.sample_interval_ns <= 0:
             raise ValueError("invalid scene sample interval")
 
@@ -497,6 +501,8 @@ class _Slot:
     sequence: int = -1
     last_accepted_ns: int | None = None
     last_uvc_sequence: int | None = None
+    # The (node, ingest session) a remote agent's frames last came from.
+    last_remote_stream: tuple | None = None
     retired_producers: set = field(default_factory=set)
     history_exhausted: bool = False
     # When the history was exhausted: a camera loss timestamped at or after
@@ -1135,7 +1141,9 @@ class SceneMonitoringRuntime:
         """`LocalUvcRuntime` frame sink; holds at most one raw frame per source."""
         try:
             slot = self._slots.get(source_id) if isinstance(source_id, UUID) else None
-            if slot is None or slot.binding.layout is None:
+            if (slot is None or slot.binding.layout is None
+                    or slot.binding.source_type is not SourceType.LOCAL_UVC):
+                # A remote agent's MJPG source takes only `on_remote_frame`.
                 return
             data, sequence = frame.data, frame.sequence
             if not isinstance(data, (bytes, bytearray, memoryview)) or type(sequence) is not int:
@@ -1150,13 +1158,53 @@ class SceneMonitoringRuntime:
         except Exception:
             return
 
+    def on_remote_frame(self, source_id: UUID, stream, jpeg: bytes) -> None:
+        """`RemotePreviewHub` frame listener (Issue #205); never blocks or raises.
+
+        A remote agent's live JPEG of a source bound with `MjpgLumaLayout`
+        is sampled like a local MJPG frame and decoded by the same confined
+        decoder child. `stream` identifies the ingest session (node and
+        generation); a new session starts a new runtime stream.
+        """
+        try:
+            slot = self._slots.get(source_id) if isinstance(source_id, UUID) else None
+            if (slot is None or slot.binding.source_type is not SourceType.REMOTE_AGENT
+                    or not isinstance(slot.binding.layout, MjpgLumaLayout)
+                    or type(jpeg) is not bytes or not isinstance(stream, tuple)):
+                return
+            now, observed_at = self._deps.monotonic_ns(), self._deps.utcnow()
+            with self._lock:
+                if slot.last_remote_stream != stream:
+                    slot.new_stream = True
+                slot.last_remote_stream = stream
+                self._accept_locked(slot, now, observed_at, jpeg, None, None, None)
+        except Exception:
+            return
+
+    def on_remote_stream_end(self, source_id: UUID) -> None:
+        """A remote source's ingest session ended (`RemotePreviewHub` listener).
+
+        A network loss cannot be told apart from a cable pulled at the
+        camera, so it is an untrusted loss: it ends a confirmation in
+        progress and never confirms tamper by itself.
+        """
+        try:
+            slot = self._slots.get(source_id) if isinstance(source_id, UUID) else None
+            if slot is None or slot.binding.source_type is not SourceType.REMOTE_AGENT:
+                return
+            with self._lock:
+                slot.last_remote_stream = None
+            self.source_unavailable(source_id, trusted=False)
+        except Exception:
+            return
+
     def offer_luma(self, source_id: UUID, *, stream_id: UUID, width: int, height: int,
                    pixels: bytes) -> bool:
         """Decoded grayscale sample from a producer without a raw layout.
 
         This is the same interface for any source whose frames are decoded
-        elsewhere, such as a future remote-agent decoder; no such producer
-        exists on Main yet, so those sources stay `unknown`.
+        elsewhere. Remote agents' MJPG live frames use `on_remote_frame`
+        instead (Issue #205).
         """
         try:
             slot = self._slots.get(source_id) if isinstance(source_id, UUID) else None
