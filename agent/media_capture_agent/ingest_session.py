@@ -277,6 +277,8 @@ class IngestSession:
         # share the one connection; every use of it holds this lock.
         self._io = threading.RLock()
         self._exchange: ClockExchange | None = None
+        # Established connections lost so far (Issue #16 ring loss trigger).
+        self.connection_losses = 0
         self._failures = 0
         self._retry_at = None
         # Issue #407: the current streak of idle closes and its latest time.
@@ -414,6 +416,11 @@ class IngestSession:
         connection, self._connection = self._connection, None
         if not keep_exchange:
             self._exchange = None
+            if connection is not None:
+                # Issue #16 (PR #433 review): an established session was lost,
+                # even if the same heartbeat reconnects before it returns. The
+                # renewal's own reconnect (``keep_exchange``) is not a loss.
+                self.connection_losses += 1
         if connection is not None:
             _shutdown(connection)
         if self._renewal_deadline is not None:

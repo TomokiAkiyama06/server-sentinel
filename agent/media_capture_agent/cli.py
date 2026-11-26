@@ -29,7 +29,7 @@ CHECK_REASONS = frozenset({
     "not_writable_by_service_account", "insufficient_free_space", "storage_unavailable",
     "service_account_mismatch", "runtime_root_unavailable", "runtime_root_permissions_unsafe",
     "runtime_root_not_writable", "node_identity_mismatch", "node_credential_unavailable",
-    "capture_pipeline_unavailable", "capture_state_unavailable",
+    "capture_pipeline_unavailable", "capture_state_unavailable", "ring_state_unavailable",
     "check_failed",
 })
 
@@ -85,6 +85,10 @@ def check_reason(exc, *, runtime=False):
         return "capture_pipeline_unavailable"
     if isinstance(exc, (ApprovalStorageError, CaptureRefused)):
         return "capture_state_unavailable"
+    # Issue #16: the ring ledger under the runtime root cannot be opened.
+    from .ring_models import RingRefused
+    if isinstance(exc, RingRefused):
+        return "ring_state_unavailable"
     if isinstance(exc, StorageRefused):
         table = _RUNTIME_REASONS if runtime else _STORAGE_REASONS
         return table.get(getattr(exc, "diagnostic", None), "check_failed")
@@ -102,6 +106,31 @@ def _capture_launcher(settings):
         return None
     from .uvc_pipeline import GStreamerLauncher
     return GStreamerLauncher(settings.capture.gst_launch)
+
+
+def _encoder_launcher(settings):
+    """Issue #16: the OpenH264 encoder child's launcher when a ring is configured.
+
+    Constructing it checks the encoder plugins, the executable and the sandbox
+    helper (root-controlled, Landlock available), so ``--check`` reports a
+    host without the encoder packages as ``capture_pipeline_unavailable``.
+    """
+    if settings.ring is None:
+        return None
+    from .h264_encoder import EncoderLauncher
+    return EncoderLauncher(settings.capture.gst_launch)
+
+
+def _ring(settings, store):
+    """The disk ring and its service monitor (Issue #16 PR C1)."""
+    from .ring import DiskRing
+    from .ring_service import RingMonitor
+    ring = DiskRing(settings, store, ledger_maximum_bytes=settings.ring.ledger_maximum_bytes)
+    try:
+        return RingMonitor(ring, settings)
+    except BaseException:
+        ring.close()
+        raise
 
 
 def _capture(settings, launcher):
@@ -160,6 +189,11 @@ def main(argv=None):
         # first (#116: fail closed before any capture; PR #412 review).
         agent = Agent(settings, store, session=session)
         launcher = _capture_launcher(settings)
+        _encoder_launcher(settings)
+        if settings.ring is not None and not args.check:
+            # The ring ledger is the service's own state (like the approval
+            # store's lock): `--check` never opens it.
+            agent.ring = _ring(settings, store)
         if launcher is not None and not args.check:
             # The approval store holds a runtime-wide lock, so `--check`
             # (also run by the installer while the service runs) only checks
@@ -196,6 +230,9 @@ def main(argv=None):
             renewal = getattr(session, "renewal_status", None)
             if renewal is not None:
                 status["renewal"] = renewal
+            # Issue #16: the ring's fixed state and reason words.
+            if agent.ring_status is not None:
+                status["ring"] = agent.ring_status
             print(json.dumps(status), flush=True)
             # A new session's first acknowledgement gives the clock exchange:
             # send the next heartbeat at once rather than a whole interval

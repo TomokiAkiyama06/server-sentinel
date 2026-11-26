@@ -147,6 +147,100 @@ class CaptureSettings:
         return cls(executable, tuple(parsed))
 
 
+@dataclass(frozen=True)
+class RingSourceSetting:
+    """One source's H.264 rate for the ring (Issue #16, Owner decision 2026-11-26).
+
+    ``target_bitrate`` is what OpenH264 aims for; ``maximum_bitrate`` is the
+    hard per-segment bound the ring admits and budgets (``SegmentProfile``);
+    ``expected_bitrate`` is the estimate shown for planning.
+    """
+
+    source_id: UUID
+    target_bitrate: int
+    maximum_bitrate: int
+    expected_bitrate: int
+    gop_frames: int
+
+
+@dataclass(frozen=True)
+class RingSettings:
+    """Optional ``ring`` section (Issue #16): how capture becomes ring segments.
+
+    The ring's mode and value (duration or capacity) are not here: the Owner
+    sets them with the local ring command, which stores them in the ring
+    ledger. This section fixes what the deployment controls: the segment
+    length, each source's encoder rate and bound, the per-segment container
+    overhead bound, the ledger size cap and how long the clock stays trusted
+    after the last good exchange with the Main (``clock_holdover_seconds``).
+    """
+
+    segment_seconds: int
+    overhead_bytes: int
+    ledger_maximum_bytes: int
+    clock_holdover_seconds: int
+    sources: tuple[RingSourceSetting, ...]
+
+    @classmethod
+    def parse(cls, value, capture):
+        keys = {"segment_seconds", "overhead_bytes", "ledger_maximum_bytes",
+                "clock_holdover_seconds", "sources"}
+        if not isinstance(value, dict) or set(value) != keys:
+            raise ConfigurationError("ring requires its segment, ledger, clock and source keys")
+        if capture is None:
+            raise ConfigurationError("ring requires a capture section")
+        for key, low, high in (("segment_seconds", 1, MAXIMUM_SEGMENT_SECONDS),
+                               ("overhead_bytes", 0, 1 << 30),
+                               ("ledger_maximum_bytes", 1, 1 << 40),
+                               ("clock_holdover_seconds", 1, MAXIMUM_CLOCK_HOLDOVER_SECONDS)):
+            if type(value[key]) is not int or not low <= value[key] <= high:
+                raise ConfigurationError("ring limit out of range")
+        sources = value["sources"]
+        if not isinstance(sources, list):
+            raise ConfigurationError("ring sources must be a list")
+        parsed = []
+        frames = {source.source_id: source.fps * value["segment_seconds"]
+                  for source in capture.sources}
+        for source in sources:
+            keys = {"source_id", "target_bitrate", "maximum_bitrate", "expected_bitrate",
+                    "gop_frames"}
+            if not isinstance(source, dict) or set(source) != keys:
+                raise ConfigurationError("ring source requires its identity, rates and GOP")
+            try:
+                identity = UUID(source["source_id"])
+            except (ValueError, TypeError, AttributeError):
+                raise ConfigurationError("invalid ring source identity") from None
+            for key in ("target_bitrate", "maximum_bitrate", "expected_bitrate"):
+                if type(source[key]) is not int or not 1 <= source[key] <= MAXIMUM_RING_BITRATE:
+                    raise ConfigurationError("ring bitrate out of range")
+            if (source["target_bitrate"] > source["maximum_bitrate"]
+                    or source["expected_bitrate"] > source["maximum_bitrate"]):
+                raise ConfigurationError("ring bitrate exceeds its maximum")
+            gop = source["gop_frames"]
+            if (identity in frames and (type(gop) is not int or not 1 <= gop <= frames[identity]
+                                        or frames[identity] % gop)):
+                # Every segment starts with an IDR picture; a GOP that divides
+                # the segment keeps the interval regular across it.
+                raise ConfigurationError("ring GOP must divide the segment's frame count")
+            parsed.append(RingSourceSetting(identity, source["target_bitrate"],
+                                            source["maximum_bitrate"], source["expected_bitrate"],
+                                            gop))
+        if sorted(source.source_id for source in parsed) != sorted(frames):
+            raise ConfigurationError("ring sources must match the capture sources")
+        return cls(value["segment_seconds"], value["overhead_bytes"],
+                   value["ledger_maximum_bytes"], value["clock_holdover_seconds"], tuple(parsed))
+
+    def source(self, source_id):
+        return next(item for item in self.sources if item.source_id == source_id)
+
+
+# Ring limits (Issue #16): the ring core accepts segments of at most PRE
+# (600 s); the clock holdover is bounded to one day; 100 Mbps per source.
+MAXIMUM_SEGMENT_SECONDS = 600
+MAXIMUM_CLOCK_HOLDOVER_SECONDS = 86400
+MAXIMUM_RING_BITRATE = 100_000_000
+
+
 # The longest heartbeat interval (Issue #14). The Main's capture ingest idle
 # timeout (30 s by default, `server/app/cameras/remote_agent/ingest_config.py`)
 # is at least three of these plus 15 s for a slow tick (storage check, clock
@@ -178,6 +272,8 @@ class Settings:
     # Optional (Issue #14): without it no camera is opened
     # (`capture_unconfigured`).
     capture: CaptureSettings | None = None
+    # Optional (Issue #16): without it nothing is recorded to the ring.
+    ring: RingSettings | None = None
 
     @classmethod
     def parse(cls, value, *, code_root):
@@ -219,11 +315,19 @@ class Settings:
             raise ConfigurationError("heartbeat interval is below the Main ingest rate budget")
         capture = (CaptureSettings.parse(value["capture"])
                    if value.get("capture") is not None else None)
+        ring = (RingSettings.parse(value["ring"], capture)
+                if value.get("ring") is not None else None)
+        if ring is not None and any(
+                (source.maximum_bitrate * ring.segment_seconds + 7) // 8 + ring.overhead_bytes
+                > value["max_segment_bytes"] for source in ring.sources):
+            # The ring refuses a profile whose bounded segment exceeds the
+            # per-write limit (``profile_exceeds_segment_write_limit``).
+            raise ConfigurationError("ring segment bound exceeds max_segment_bytes")
         return cls(node_id, runtime, media, expected, value["service_uid"],
                    value["safety_reserve_bytes"], value["max_segment_bytes"],
                    value["heartbeat_seconds"], value["clock_offset_limit_seconds"],
                    value["clock_uncertainty_limit_seconds"], value["clock_step_limit_seconds"],
-                   main_ingest, capture)
+                   main_ingest, capture, ring)
 
     @classmethod
     def load(cls, path, *, code_root):
@@ -233,7 +337,7 @@ class Settings:
         return cls.parse(value, code_root=code_root)
 
 
-_OPTIONAL_SETTINGS = ("main_ingest", "capture")
+_OPTIONAL_SETTINGS = ("main_ingest", "capture", "ring")
 MAX_CONFIGURATION_BYTES = 65536
 
 

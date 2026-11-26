@@ -44,6 +44,38 @@ yet (PR C):
 These checks establish structure only. Decodability is checked by an
 `openh264dec` child (D13), which PR B adds together with the encoder child.
 
+## In the service (Issue #16 PR C1)
+
+With a `ring` deployment section (agent/README.md), the service opens the
+`DiskRing` at start. `--check` never opens it, because the ledger is the
+service's own state. If the ring cannot be opened, the service fails with
+`ring_state_unavailable`, so the node goes offline and the Main's node-health
+notices report it.
+
+After every heartbeat attempt, `ring_service.RingMonitor` does two things:
+
+- It tells the ring whether the authenticated session is up. A session that
+  was up and is now down starts the 10 + 10 minute incident. Owner decision
+  2026-11-26: a Main that stops or restarts on purpose counts too.
+- It then runs `tick` (completion, 60-day expiry, trimming).
+
+`ClockTrust` trusts the Agent's clock while the last exchange with the Main
+was within limits. After that it stays trusted for `clock_holdover_seconds`,
+as long as wall time keeps pace with the monotonic clock. That is how the
+post-loss 10 minutes get trusted times without the Main.
+
+Known limits:
+
+- The ring keeps "connected" in memory. A Main outage that begins while the
+  Agent itself is restarting is therefore not a detected loss.
+- Until the Owner configures the ring (the local ring command, PR D), it
+  reports `not_configured` and no loss can be protected.
+- While the ledger's committed profiles differ from the deployment's, it
+  reports `ring_reconfiguration_required`.
+- The ring state appears only in the local status line (`"ring"`). A summary
+  in the heartbeat to the Main waits for PR E.
+- Nothing is appended yet: the recorder that feeds encoded segments is PR C2.
+
 ## Inputs and control boundary
 
 `SegmentProfile` takes a source UUID, bounded/expected bitrate in bits per second,
