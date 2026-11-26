@@ -100,6 +100,11 @@ class CommandTests(unittest.TestCase):
                 uvc_sandbox.parse(argv)
 
 
+def landlock_available():
+    """A supported ABI for mocked launchers, so they never need a real Landlock."""
+    return 1
+
+
 def plugin_dir(temporary, names=ENCODER_PLUGINS):
     plugins = Path(temporary) / "plugins"
     plugins.mkdir()
@@ -113,7 +118,8 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             plugins = plugin_dir(temporary, ENCODER_PLUGINS[:-1])
             with self.assertRaisesRegex(PipelineError, "encoder plugins are unavailable"):
-                EncoderLauncher("/bin/true", trust=Path, trust_file=Path, plugin_dirs=[plugins])
+                EncoderLauncher("/bin/true", trust=Path, trust_file=Path, plugin_dirs=[plugins],
+                                sandbox_abi=landlock_available)
         with tempfile.TemporaryDirectory() as temporary:
             plugins = plugin_dir(temporary)
             with self.assertRaisesRegex(PipelineError, "sandbox is unavailable"):
@@ -132,7 +138,8 @@ class LauncherTests(unittest.TestCase):
             popen = mock.Mock(side_effect=OSError("synthetic"))
             launcher = EncoderLauncher("/usr/bin/gst-launch-1.0", trust=trust, trust_file=trust,
                                        plugin_dirs=[plugins], python="/usr/bin/python3",
-                                       helper="/opt/helper", helper_args=(), popen=popen)
+                                       helper="/opt/helper", helper_args=(), popen=popen,
+                                       sandbox_abi=landlock_available)
             calls.clear()
             with self.assertRaisesRegex(PipelineError, "could not start"):
                 launcher.launch(PROFILE)
@@ -156,7 +163,7 @@ class LauncherTests(unittest.TestCase):
             plugins = plugin_dir(temporary)
             with self.assertRaises(PipelineError):
                 EncoderLauncher("/usr/bin/gst-launch-1.0", trust=Path, trust_file=refuse,
-                                plugin_dirs=[plugins])
+                                plugin_dirs=[plugins], sandbox_abi=landlock_available)
 
 
 SLOW_READER = """#!/usr/bin/python3 -I
