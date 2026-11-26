@@ -40,6 +40,16 @@ policy, audited codec validator/muxer and authorization prerequisites are wired.
   allowed formats/configuration, bounded decode dimensions and independent
   decodability before storage. No production validator is shipped here. Tests
   use generated deflate bytes only and do **not** claim playable video.
+  `fmp4_h264.py` (Issue #313, D13) provides the structural half for H.264
+  fragmented MP4. `StructuralH264Fmp4` accepts exactly the layout of the
+  project's own writer (`agent/media_capture_agent/fmp4.py`): one video
+  track, no audio or metadata, an empty sample table, samples that fill
+  `mdat`, an IDR first, an SPS within the profile allowlist and the size
+  bound that matches the track, and a duration within one frame of the
+  segment's interval. Any deviation gets a fixed `RecordingError` code.
+  `ValidatedH264Segments` adds the full-frame decoder (a confined
+  `openh264dec` child; a follow-up). Until that decoder exists, Main keeps
+  `RefuseUnvalidatedSegments`, because structure alone is not decodability.
 - Call all methods on one owning worker thread; a competing store/process is
   rejected before recovery can alter the first worker's active recordings.
   Upstream must use its bounded media queue and surface every rejected append as
