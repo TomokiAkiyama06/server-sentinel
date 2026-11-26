@@ -4,8 +4,9 @@
 connects it to the service loop:
 
 * ``ClockTrust`` decides whether the Agent's own clock may time ring writes.
-  It is trusted while the last clock exchange with the Main is within the
-  configured limits (``health.assess_clock`` is ``online``). While the Main is
+  It is trusted from the receive time of a clock exchange with the Main
+  that is within the configured limits (``health.assess_clock`` is
+  ``online``). While the Main is
   unreachable there is no exchange, yet the T+10 minutes after a loss must be
   recorded with trusted times, so the clock stays trusted for a bounded
   holdover after the last good exchange (``clock_holdover_seconds``), as long
@@ -58,34 +59,38 @@ class ClockTrust:
         self.holdover_seconds = holdover_seconds
         self.step_limit_seconds = step_limit_seconds
         self._lock = threading.Lock()
-        self._good = None  # (utc, monotonic) of the last online assessment
+        # (utc, monotonic) at which an exchange with the Main last showed the
+        # clock within its limits: the exchange's own receive time, not the
+        # time it is evaluated (PR #433 review).
+        self._good = None
 
-    def observe(self, online, utc, monotonic):
-        """Return whether the clock may time ring writes at (``utc``, ``monotonic``).
+    def observe(self, sample, utc, monotonic):
+        """Whether the clock may time ring writes at (``utc``, ``monotonic``).
 
-        ``online`` is the heartbeat's clock assessment; a recorder thread,
-        which has none, passes ``False`` and is trusted within the holdover
-        of the last good exchange.
+        ``sample`` is the (utc, monotonic) receive time of a clock exchange
+        assessed ``online``, or ``None`` (no good exchange this time; a
+        recorder thread always passes ``None``). Trust then requires that wall
+        time advanced with the monotonic clock since the latest good sample
+        (no step beyond the limit) and that the holdover has not run out; a
+        sample taken after a wall-clock step is checked the same way before
+        it is used.
         """
         with self._lock:
-            return self._observe(online, utc, monotonic)
-
-    def _observe(self, online, utc, monotonic):
-        if online:
-            self._good = (utc, monotonic)
+            if sample is not None:
+                sample_utc, sample_monotonic = sample
+                if sample_monotonic <= monotonic:
+                    self._good = (sample_utc, sample_monotonic)
+            if self._good is None:
+                return False
+            good_utc, good_monotonic = self._good
+            elapsed = monotonic - good_monotonic
+            if (elapsed < 0 or elapsed > self.holdover_seconds
+                    or abs((utc - good_utc) - elapsed) > self.step_limit_seconds):
+                # Expired, or the wall clock was stepped: only a new good
+                # exchange trusts the clock again.
+                self._good = None
+                return False
             return True
-        if self._good is None:
-            return False
-        good_utc, good_monotonic = self._good
-        elapsed = monotonic - good_monotonic
-        if elapsed < 0 or elapsed > self.holdover_seconds:
-            self._good = None
-            return False
-        if abs((utc - good_utc) - elapsed) > self.step_limit_seconds:
-            # The wall clock was stepped since the last good exchange.
-            self._good = None
-            return False
-        return True
 
 
 class RingMonitor:
@@ -100,15 +105,25 @@ class RingMonitor:
     def reconfiguration_required(self):
         return self.ring.config is not None and self.ring.profiles != self.profiles
 
-    def clock_trusted(self, online, utc, monotonic):
-        return self.clock.observe(online, utc, monotonic)
+    def clock_trusted(self, utc, monotonic):
+        """For a recorder thread: trusted within the holdover of the last good exchange."""
+        return self.clock.observe(None, utc, monotonic)
 
-    def after_heartbeat(self, *, clock_online, authenticated, connected, utc, monotonic):
-        """Report the session state to the ring and advance it; never raises a ring refusal."""
+    def after_heartbeat(self, *, clock_sample, authenticated, connected, lost, utc, monotonic):
+        """Report the session state to the ring and advance it; never raises a ring refusal.
+
+        ``lost`` is True when the session lost an established connection
+        since the previous heartbeat, even if it reconnected before this one
+        returned (PR #433 review): the ring then sees the down transition.
+        """
         now_us = int(utc * SECOND)
-        trusted = self.clock.observe(clock_online, utc, monotonic)
+        trusted = self.clock.observe(clock_sample, utc, monotonic)
         try:
             if self.ring.config is not None:
+                if lost:
+                    self.ring.observe_connection(authenticated=authenticated, connected=False,
+                                                 unexpected=True, now_us=now_us,
+                                                 clock_trusted=trusted)
                 self.ring.observe_connection(authenticated=authenticated, connected=connected,
                                              unexpected=True, now_us=now_us,
                                              clock_trusted=trusted)

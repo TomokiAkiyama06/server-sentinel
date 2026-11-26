@@ -82,6 +82,14 @@ class UnconfiguredIngestSession(UnpairedSession):
 
 
 class Agent:
+    # Issue #16: an optional ``ring_service.RingMonitor``; its state after
+    # each tick is ``ring_status`` (local status only, not the heartbeat).
+    # Class defaults keep instances built without ``__init__`` (the server's
+    # heartbeat contract test) valid.
+    ring = None
+    ring_status = None
+    _seen_losses = None
+
     def __init__(self, settings, store, *, capture=None, session=None, ring=None,
                  utc=time.time, monotonic=time.monotonic):
         if os.geteuid() == 0 or os.geteuid() != settings.service_uid:
@@ -110,10 +118,7 @@ class Agent:
         self.store = store
         self.capture = capture or UnconfiguredCapture()
         self.session = session or UnpairedSession()
-        # Issue #16: an optional ``ring_service.RingMonitor``; its state after
-        # each tick is ``ring_status`` (local status only, not the heartbeat).
         self.ring = ring
-        self.ring_status = None
         self.utc = utc
         self.monotonic = monotonic
         self.sequence = 0
@@ -187,12 +192,20 @@ class Agent:
                         self.clock_refresh_due = self.session.exchange_clock() is not None
                     except (ConnectionError, TimeoutError, OSError):
                         pass
+        # Established connections the session lost so far, if it counts them
+        # (``ingest_session.IngestSession``).
+        losses = getattr(self.session, "connection_losses", None)
+        lost = (type(losses) is int and type(self._seen_losses) is int
+                and losses != self._seen_losses)
+        self._seen_losses = losses
         if self.ring is not None:
             # Issue #16: a session that was up and is now down is the loss
             # (T0) that protects 10 minutes on each side of it.
+            sample = ((exchange.local_receive_utc, exchange.local_receive_monotonic)
+                      if clock.state == "online" else None)
             self.ring_status = self.ring.after_heartbeat(
-                clock_online=clock.state == "online",
-                authenticated=bool(self.session.authenticated), connected=connected,
+                clock_sample=sample, authenticated=bool(self.session.authenticated),
+                connected=connected, lost=lost,
                 utc=heartbeat["utc_seconds"], monotonic=heartbeat["monotonic_seconds"])
         return heartbeat
 

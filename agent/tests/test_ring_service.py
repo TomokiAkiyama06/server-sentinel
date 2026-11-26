@@ -23,6 +23,7 @@ from media_capture_agent.runtime import Agent
 from media_capture_agent.storage import MediaStore
 from media_capture_agent.uvc_pipeline import PipelineError
 from tests import support
+from media_capture_agent.health import ClockExchange
 from tests.support import SOURCE, MockSession, ring_temporary_directory
 from tests.test_ring import LEDGER_BYTES, AllowControls, Quota
 
@@ -104,23 +105,34 @@ class SettingsTests(unittest.TestCase):
 class ClockTrustTests(unittest.TestCase):
     def test_holdover_after_the_last_good_exchange(self):
         clock = ClockTrust(holdover_seconds=900, step_limit_seconds=5)
-        self.assertFalse(clock.observe(False, 1000.0, 10.0))  # never good yet
-        self.assertTrue(clock.observe(True, 1000.0, 10.0))
-        self.assertTrue(clock.observe(False, 1600.0, 610.0))
-        self.assertTrue(clock.observe(False, 1900.0, 910.0))  # exactly the holdover
-        self.assertFalse(clock.observe(False, 1900.5, 910.5))
+        self.assertFalse(clock.observe(None, 1000.0, 10.0))  # never good yet
+        self.assertTrue(clock.observe((999.0, 9.0), 1000.0, 10.0))
+        self.assertTrue(clock.observe(None, 1600.0, 610.0))
+        self.assertTrue(clock.observe(None, 1899.0, 909.0))  # exactly the holdover
+        self.assertFalse(clock.observe(None, 1899.5, 909.5))
         # Expired: only a new good exchange trusts the clock again.
-        self.assertFalse(clock.observe(False, 1901.0, 911.0))
-        self.assertTrue(clock.observe(True, 1902.0, 912.0))
+        self.assertFalse(clock.observe(None, 1901.0, 911.0))
+        self.assertTrue(clock.observe((1901.5, 911.5), 1902.0, 912.0))
 
     def test_a_wall_clock_step_or_monotonic_regression_ends_the_holdover(self):
         clock = ClockTrust(holdover_seconds=900, step_limit_seconds=5)
-        clock.observe(True, 1000.0, 10.0)
-        self.assertTrue(clock.observe(False, 1104.0, 110.0))   # 4 s drift: within the limit
-        self.assertFalse(clock.observe(False, 1200.0, 150.0))  # 50 s step
-        self.assertFalse(clock.observe(False, 1201.0, 151.0))
-        clock.observe(True, 2000.0, 200.0)
-        self.assertFalse(clock.observe(False, 2001.0, 199.0))
+        clock.observe((1000.0, 10.0), 1000.0, 10.0)
+        self.assertTrue(clock.observe(None, 1104.0, 110.0))   # 4 s drift: within the limit
+        self.assertFalse(clock.observe(None, 1200.0, 150.0))  # 50 s step
+        self.assertFalse(clock.observe(None, 1201.0, 151.0))
+        clock.observe((2000.0, 200.0), 2000.0, 200.0)
+        self.assertFalse(clock.observe(None, 2001.0, 199.0))
+
+    def test_a_step_after_the_good_exchange_is_not_trusted(self):
+        # PR #433 review (P1): the exchange was good, but the wall clock
+        # jumped forward before this heartbeat; its time must not anchor trust.
+        clock = ClockTrust(holdover_seconds=900, step_limit_seconds=5)
+        self.assertFalse(clock.observe((1000.0, 10.0), 1000.0 + 3600.0 + 2.0, 12.0))
+        self.assertFalse(clock.observe(None, 4603.0, 13.0))
+
+    def test_a_sample_from_the_future_is_ignored(self):
+        clock = ClockTrust(holdover_seconds=900, step_limit_seconds=5)
+        self.assertFalse(clock.observe((1000.0, 20.0), 990.0, 10.0))
 
     def test_limits_must_be_positive(self):
         with self.assertRaises(ValueError):
@@ -157,8 +169,8 @@ class MonitorTests(unittest.TestCase):
                                        code_root=root / "code")
 
     def heartbeat(self, monitor, **changes):
-        values = dict(clock_online=True, authenticated=True, connected=True, utc=5000.0,
-                      monotonic=100.0)
+        values = dict(clock_sample=(4999.0, 99.0), authenticated=True, connected=True,
+                      lost=False, utc=5000.0, monotonic=100.0)
         values.update(changes)
         return monitor.after_heartbeat(**values)
 
@@ -175,10 +187,18 @@ class MonitorTests(unittest.TestCase):
         ring = FakeRing(config=RingConfig("duration", 600), profiles=profiles)
         monitor = RingMonitor(ring, self.settings)
         self.heartbeat(monitor)
-        self.heartbeat(monitor, connected=False, clock_online=False, utc=5002.0, monotonic=102.0)
+        self.heartbeat(monitor, connected=False, clock_sample=None, utc=5002.0, monotonic=102.0)
         self.assertEqual([(item["connected"], item["unexpected"], item["clock_trusted"],
                            item["now_us"]) for item in ring.observed],
                          [(True, True, True, 5000 * SECOND), (False, True, True, 5002 * SECOND)])
+
+    def test_a_loss_reconnected_within_one_heartbeat_is_still_a_down_transition(self):
+        # PR #433 review (P2).
+        profiles = {profile.source_id: profile for profile in ring_profiles(self.settings)}
+        ring = FakeRing(config=RingConfig("duration", 600), profiles=profiles)
+        monitor = RingMonitor(ring, self.settings)
+        self.heartbeat(monitor, lost=True)
+        self.assertEqual([item["connected"] for item in ring.observed], [False, True])
 
     def test_a_ring_refusal_is_reported_not_raised(self):
         status = self.heartbeat(RingMonitor(FakeRing(tick_error="ledger_unavailable"),
@@ -193,6 +213,32 @@ class MonitorTests(unittest.TestCase):
         monitor = RingMonitor(ring, self.settings)
         self.assertTrue(monitor.reconfiguration_required)
         self.assertEqual(self.heartbeat(monitor)["reason"], "ring_reconfiguration_required")
+
+
+class ClockedSession(MockSession):
+    """A synthetic session whose clock exchange matches the test clock."""
+
+    def __init__(self, now):
+        super().__init__()
+        self.now = now
+        self.connection_losses = 0
+        self.reconnect_once = False
+
+    def exchange_clock(self):
+        if self.fail:
+            raise ConnectionError("synthetic outage")
+        utc, monotonic = self.now[0], self.now[0] - 7000.0
+        return ClockExchange(utc - 0.2, monotonic - 0.2, utc - 0.1, utc - 0.1, utc, monotonic)
+
+    def send_heartbeat(self, heartbeat):
+        if self.reconnect_once:
+            # The Main restarted: the old connection is dropped and the same
+            # call reconnects and sends.
+            self.reconnect_once = False
+            self.connection_losses += 1
+        if self.fail:
+            self.connection_losses += 1
+        super().send_heartbeat(heartbeat)
 
 
 class AgentLossTests(unittest.TestCase):
@@ -212,7 +258,7 @@ class AgentLossTests(unittest.TestCase):
         self.now = [7200.0]
         ring.configure(RingConfig("duration", 600), ring_profiles(self.settings),
                        now_us=int(self.now[0] * SECOND), clock_trusted=True)
-        self.session = MockSession()
+        self.session = ClockedSession(self.now)
         self.agent = Agent(self.settings, self.store, session=self.session,
                            ring=RingMonitor(ring, self.settings),
                            utc=lambda: self.now[0], monotonic=lambda: self.now[0] - 7000.0)
@@ -237,6 +283,15 @@ class AgentLossTests(unittest.TestCase):
         self.now[0] += 2
         self.agent.tick()
         self.assertEqual(len(self.incidents()), 1)
+
+    def test_a_restart_reconnected_inside_one_heartbeat_is_a_loss(self):
+        self.agent.tick()
+        self.now[0] += 2
+        self.session.reconnect_once = True
+        self.agent.tick()
+        loss = int(self.now[0] * SECOND)
+        self.assertEqual([(row["start"], row["end"]) for row in self.incidents()],
+                         [(loss - PRE, loss + POST)])
 
     def test_a_node_that_never_connected_has_no_loss(self):
         self.session.fail = True
@@ -296,6 +351,30 @@ class CliTests(unittest.TestCase):
         self.assertTrue(stderr.endswith(": ring_state_unavailable\n"))
         self.assertNotIn("ledger_root_ownership", stderr)
         self.assertIn("ring_state_unavailable", cli.CHECK_REASONS)
+
+
+class SessionLossCounterTests(unittest.TestCase):
+    """``IngestSession.connection_losses`` counts lost sessions, not renewals."""
+
+    def test_a_dropped_connection_counts_and_a_renewal_reconnect_does_not(self):
+        from media_capture_agent.config import MainIngestEndpoint
+        from media_capture_agent.ingest_session import IngestSession
+        from media_capture_agent.pairing import NodeCredentialStore
+        temporary = ring_temporary_directory()
+        self.addCleanup(temporary.cleanup)
+        runtime = Path(temporary.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        session = IngestSession(NodeCredentialStore(runtime), MainIngestEndpoint("127.0.0.1", 9),
+                                support.NODE)
+        self.assertEqual(session.connection_losses, 0)
+        session._drop()  # nothing established: not a loss
+        self.assertEqual(session.connection_losses, 0)
+        session._connection = mock.Mock()
+        session._drop(keep_exchange=True)  # the renewal's own reconnect
+        self.assertEqual(session.connection_losses, 0)
+        session._connection = mock.Mock()
+        session._drop()
+        self.assertEqual(session.connection_losses, 1)
 
 
 if __name__ == "__main__":
