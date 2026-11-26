@@ -52,6 +52,10 @@ LATENCY_US = 250_000       # a frame captured this long ago may still be queued
 WRITE_TIMEOUT_SECONDS = 2.0
 FINISH_TIMEOUT_SECONDS = 15.0
 STOP_TIMEOUT_SECONDS = 5.0
+# Segments waiting for the finisher (each holds an encoder, its pipes and its
+# output). A slower finisher drops further segments instead of piling them up
+# (PR #434 review).
+MAX_PENDING_SEGMENTS = 3
 POLL_SECONDS = 0.05
 READ_BYTES = 65536
 
@@ -126,6 +130,9 @@ class SegmentRecorder:
         self._queue_limit = self.fps * QUEUE_SECONDS
         self._wake = threading.Condition()
         self._stopping = False
+        # Set only after the recorder thread stopped: the finisher drains
+        # until then, so no segment is enqueued after it left (PR #434 review).
+        self._producer_done = False
         self._anchor = None        # (utc_us, mono_us)
         self._next = None          # (index, start_utc_us, start_mono_us) of the first segment
         self._segment = None
@@ -301,13 +308,20 @@ class SegmentRecorder:
             if segment.failure != "ring_not_ready":
                 self._count("segment_dropped_" + segment.failure)
             return
-        segment.encoder.process.close_input()
         if self._finish_inline:
+            segment.encoder.process.close_input()
             self._finish(segment)
             return
         with self._wake:
-            self._finishing.append(segment)
-            self._wake.notify_all()
+            backlog = len(self._finishing) >= MAX_PENDING_SEGMENTS
+            if not backlog:
+                segment.encoder.process.close_input()
+                self._finishing.append(segment)
+                self._wake.notify_all()
+        if backlog:
+            self._count("segment_dropped_finish_backlog")
+            segment.encoder.discard()
+            segment.encoder = None
 
     def _abandon(self, reason):
         segment, self._segment = self._segment, None
@@ -322,7 +336,7 @@ class SegmentRecorder:
     def _finish_loop(self):
         while True:
             with self._wake:
-                while not self._finishing and not self._stopping:
+                while not self._finishing and not self._producer_done:
                     self._wake.wait()
                 if not self._finishing:
                     return
@@ -394,5 +408,17 @@ class SegmentRecorder:
         if segment is not None and segment.encoder is not None:
             segment.encoder.discard()
         self._discard_spare()
+        with self._wake:
+            self._producer_done = True
+            self._wake.notify_all()
         if self._finisher is not None:
             self._finisher.join(FINISH_TIMEOUT_SECONDS * 2 + 1)
+        # Whatever is still queued (no finisher, or one that did not finish in
+        # time) is cleaned up, never left with a running encoder.
+        with self._wake:
+            leftover = list(self._finishing)
+            self._finishing.clear()
+        for segment in leftover:
+            self._count("segment_dropped_shutdown")
+            if segment.encoder is not None:
+                segment.encoder.discard()

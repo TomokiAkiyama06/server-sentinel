@@ -280,6 +280,58 @@ class OfferTests(unittest.TestCase):
                              and thread.is_alive() for thread in threading.enumerate()))
 
 
+class FinishingTests(unittest.TestCase):
+    def recorder(self, ring, launcher, **options):
+        clock = Clock()
+        recorder = SegmentRecorder(
+            SOURCE, CAPTURE, SETTING, segment_seconds=1, ring=ring, monitor=FakeMonitor(),
+            launcher=launcher, step_limit_seconds=0.5, utc=clock.utc,
+            monotonic=clock.monotonic, **options)
+        return recorder, clock
+
+    def test_the_pending_segments_are_bounded(self):
+        # PR #434 review (P1): no finisher drains here, so the backlog fills.
+        from media_capture_agent.recorder import MAX_PENDING_SEGMENTS
+        launcher = FakeLauncher()
+        recorder, clock = self.recorder(FakeRing(), launcher, start=False)
+        index = 0
+        while index / FPS < MAX_PENDING_SEGMENTS + 3:
+            clock.mono = index / FPS
+            recorder.feed(round(clock.mono * SECOND), JPEG)
+            index += 1
+        self.assertEqual(len(recorder._finishing), MAX_PENDING_SEGMENTS)
+        self.assertGreaterEqual(recorder.status()["segment_dropped_finish_backlog"], 1)
+        dropped = [process for process in launcher.launched if process.stopped]
+        self.assertGreaterEqual(len(dropped), 1)
+        recorder.close()
+        self.assertEqual(recorder.status()["segment_dropped_shutdown"], MAX_PENDING_SEGMENTS)
+        self.assertEqual(len(recorder._finishing), 0)
+
+    def test_the_finisher_drains_until_the_recorder_has_stopped(self):
+        # PR #434 review (P2): a segment queued after "stopping" was set, while
+        # the recorder thread is still running, is still finished.
+        ring = FakeRing()
+        recorder, clock = self.recorder(ring, FakeLauncher(), start=False)
+        recorder._finisher = threading.Thread(target=recorder._finish_loop, daemon=True)
+        recorder._finisher.start()
+        with recorder._wake:
+            recorder._stopping = True
+            recorder._wake.notify_all()
+        time.sleep(0.2)
+        self.assertTrue(recorder._finisher.is_alive())
+        index = 0
+        while index / FPS < 1.9:
+            clock.mono = index / FPS
+            recorder.feed(round(clock.mono * SECOND), JPEG)
+            index += 1
+        clock.mono = 2.2
+        recorder.poll(round(clock.mono * SECOND))
+        recorder.close()
+        self.assertEqual([(start // SECOND, end // SECOND) for start, end, *_ in ring.appended],
+                         [(1001, 1002)])
+        self.assertFalse(recorder._finisher.is_alive())
+
+
 REQUIRED = os.environ.get("AGENT_OPENH264_REQUIRED") == "1"
 
 
