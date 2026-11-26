@@ -161,7 +161,9 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertNotEqual(-1, end)
         job = workflow[start:end]
         self.assertIn("\n    runs-on: ubuntu-24.04\n", job)
-        install = job.find("sudo apt-get install --yes --no-install-recommends python3-cryptography\n")
+        install = job.find("sudo apt-get install --yes --no-install-recommends python3-cryptography \\\n"
+                           "            gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \\\n"
+                           "            gstreamer1.0-plugins-bad libopenh264-7\n")
         versions = job.find('sys.exit(sys.version_info[:2] != (3, 12)\n'
                             '                   or cryptography.__version__.split(".")[0] != "41"\n'
                             '                   or not cryptography.__file__.startswith('
@@ -173,6 +175,8 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertLess(install, versions)
         self.assertLess(versions, tests)
         self.assertIn("\n        working-directory: agent\n", job)
+        # Issue #16 PR B: the real OpenH264 encoder test must run, not skip.
+        self.assertIn("\n          AGENT_OPENH264_REQUIRED: '1'\n", job)
         # No setup-python: the system interpreter is the one under test.
         self.assertNotIn("setup-python", job)
 

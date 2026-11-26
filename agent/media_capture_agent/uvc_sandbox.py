@@ -19,6 +19,12 @@ Any failure exits before ``exec``: the pipeline never runs unconfined. The
 module is stdlib-only and runnable as a script::
 
     python3 -I -S uvc_sandbox.py --device-fd N [--read PATH]... -- EXECUTABLE [ARG]...
+    python3 -I -S uvc_sandbox.py --no-device [--read PATH]... -- EXECUTABLE [ARG]...
+
+``--no-device`` (Issue #16) confines the H.264 encoder child, which reads
+JPEG frames from its stdin and writes the encoded stream to its stdout: it is
+granted no device inode at all, so it cannot open any camera, ``/dev`` node or
+other file outside the read-only paths.
 
 From the installed zipapp artifact the same helper is the artifact file itself,
 whose ``__main__`` dispatches ``ARCHIVE_ENTRY`` here before importing any other
@@ -58,6 +64,8 @@ _FILE_RIGHTS = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE | FS_IOCT
 EXIT_REFUSED = 126
 # First argument of the installed artifact that selects this helper.
 ARCHIVE_ENTRY = "--uvc-sandbox"
+# Issue #16: the encoder child is confined without any device.
+NO_DEVICE = "--no-device"
 # The only paths a pipeline child may read; plugin loading itself is restricted
 # separately by the launcher's environment and ``--gst-plugin-load``.
 DEFAULT_READ_PATHS = ("/usr", "/lib", "/lib64", "/etc/ld.so.cache")
@@ -104,16 +112,22 @@ def _check(result, libc):
 
 
 def restrict(device_fd, read_paths=DEFAULT_READ_PATHS, *, libc=None):
-    """Confine the calling (single-threaded) process; irreversible."""
+    """Confine the calling (single-threaded) process; irreversible.
+
+    ``device_fd=None`` (``--no-device``, Issue #16 encoder child) grants no
+    device at all: the process can then only read ``read_paths`` and use the
+    descriptors it inherited.
+    """
     libc = libc or _libc()
     abi = abi_version(libc)
     fs, net, scoped = handled_rights(abi)
-    try:
-        info = os.fstat(device_fd)
-    except (OSError, TypeError):
-        raise SandboxError("video pipeline sandbox could not be applied") from None
-    if not stat.S_ISCHR(info.st_mode):
-        raise SandboxError("video pipeline sandbox could not be applied")
+    if device_fd is not None:
+        try:
+            info = os.fstat(device_fd)
+        except (OSError, TypeError):
+            raise SandboxError("video pipeline sandbox could not be applied") from None
+        if not stat.S_ISCHR(info.st_mode):
+            raise SandboxError("video pipeline sandbox could not be applied")
     attr = ctypes.create_string_buffer(struct.pack("=QQQ", fs, net, scoped))
     ruleset = _check(libc.syscall(ctypes.c_long(_SYS_CREATE_RULESET), attr,
                                   ctypes.c_size_t(len(attr.raw)), ctypes.c_uint32(0)), libc)
@@ -139,7 +153,8 @@ def restrict(device_fd, read_paths=DEFAULT_READ_PATHS, *, libc=None):
                 allow(fd, rights & fs)
             finally:
                 os.close(fd)
-        allow(device_fd, device_rights(abi))
+        if device_fd is not None:
+            allow(device_fd, device_rights(abi))
         _check(libc.prctl(ctypes.c_int(_PR_SET_NO_NEW_PRIVS), ctypes.c_ulong(1),
                           ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0)), libc)
         _check(libc.syscall(ctypes.c_long(_SYS_RESTRICT_SELF), ctypes.c_int(ruleset),
@@ -150,26 +165,34 @@ def restrict(device_fd, read_paths=DEFAULT_READ_PATHS, *, libc=None):
 
 
 def parse(argv):
-    """``--device-fd N [--read PATH]... -- EXECUTABLE [ARG]...``"""
+    """``(--device-fd N | --no-device) [--read PATH]... -- EXECUTABLE [ARG]...``"""
     try:
         split = argv.index("--")
     except ValueError:
         raise SandboxError("invalid sandbox command") from None
     options, command = argv[:split], argv[split + 1:]
-    device_fd, read_paths = None, []
+    device_fd, no_device, read_paths = None, False, []
     index = 0
     while index < len(options):
         flag = options[index]
+        if flag == NO_DEVICE and device_fd is None and not no_device:
+            no_device = True
+            index += 1
+            continue
         if index + 1 >= len(options):
             raise SandboxError("invalid sandbox command")
         value = options[index + 1]
-        if flag == "--device-fd" and device_fd is None and value.isdigit():
+        if flag == "--device-fd" and device_fd is None and not no_device and value.isdigit():
             device_fd = int(value)
         elif flag == "--read" and os.path.isabs(value):
             read_paths.append(value)
         else:
             raise SandboxError("invalid sandbox command")
         index += 2
+    if no_device:
+        if not command or not os.path.isabs(command[0]):
+            raise SandboxError("invalid sandbox command")
+        return None, tuple(read_paths) or DEFAULT_READ_PATHS, command
     if device_fd is None or device_fd < 3 or not command or not os.path.isabs(command[0]):
         raise SandboxError("invalid sandbox command")
     return device_fd, tuple(read_paths) or DEFAULT_READ_PATHS, command
