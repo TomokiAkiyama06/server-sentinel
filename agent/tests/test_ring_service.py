@@ -90,6 +90,11 @@ class SettingsTests(unittest.TestCase):
             "expected above maximum": with_ring(self.base, sources=source(expected_bitrate=12001)),
             "GOP does not divide": with_ring(self.base, sources=source(gop_frames=7)),
             "GOP above segment": with_ring(self.base, sources=source(gop_frames=600)),
+            # PR #434 review: 60 s at 30 fps is 1800 frames; the encoder caps
+            # its GOP at 1000, so 1800 must be refused here, not at start.
+            "GOP above encoder limit": with_ring(self.base, segment_seconds=60,
+                                                 sources=source(gop_frames=1800,
+                                                                maximum_bitrate=2000)),
             "zero GOP": with_ring(self.base, sources=source(gop_frames=0)),
             "bool bitrate": with_ring(self.base, sources=source(maximum_bitrate=True)),
             "segment too long": with_ring(self.base, segment_seconds=601),
@@ -172,7 +177,8 @@ class MonitorTests(unittest.TestCase):
         values = dict(clock_sample=(4999.0, 99.0), authenticated=True, connected=True,
                       lost=False, utc=5000.0, monotonic=100.0)
         values.update(changes)
-        return monitor.after_heartbeat(**values)
+        utc, monotonic = values.pop("utc"), values.pop("monotonic")
+        return monitor.after_heartbeat(utc=lambda: utc, monotonic=lambda: monotonic, **values)
 
     def test_an_unconfigured_ring_is_ticked_but_given_no_loss(self):
         ring = FakeRing()

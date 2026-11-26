@@ -36,6 +36,7 @@ waits for the Main side (PR E).
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 
 from .ring_models import SECOND, RingRefused, SegmentProfile
@@ -50,6 +51,16 @@ def ring_profiles(settings):
                                 source.expected_bitrate, ring.segment_seconds * SECOND,
                                 ring.overhead_bytes)
                  for source in ring.sources)
+
+
+def ring_lock(ring):
+    """The ring's operation lock (re-entrant), or no lock for a stand-in ring.
+
+    Every reader of the clock that then writes to the ring holds it across
+    both, so ring operations see non-decreasing times (PR #434 review).
+    """
+    lock = getattr(ring, "lock", None)
+    return lock if lock is not None else contextlib.nullcontext()
 
 
 class ClockTrust:
@@ -115,21 +126,26 @@ class RingMonitor:
         ``lost`` is True when the session lost an established connection
         since the previous heartbeat, even if it reconnected before this one
         returned (PR #433 review): the ring then sees the down transition.
+        ``utc`` and ``monotonic`` are clock functions: the time is read under
+        the ring's lock, so a recorder's append in between can never make
+        this observation older than the ring's latest time (PR #434 review).
         """
-        now_us = int(utc * SECOND)
-        trusted = self.clock.observe(clock_sample, utc, monotonic)
-        try:
-            if self.ring.config is not None:
-                if lost:
-                    self.ring.observe_connection(authenticated=authenticated, connected=False,
-                                                 unexpected=True, now_us=now_us,
-                                                 clock_trusted=trusted)
-                self.ring.observe_connection(authenticated=authenticated, connected=connected,
-                                             unexpected=True, now_us=now_us,
-                                             clock_trusted=trusted)
-            status = self.ring.tick(now_us=now_us, clock_trusted=trusted)
-        except RingRefused as exc:
-            status = {"state": "degraded", "reason": str(exc)}
+        with ring_lock(self.ring):
+            now_utc, now_monotonic = utc(), monotonic()
+            now_us = int(now_utc * SECOND)
+            trusted = self.clock.observe(clock_sample, now_utc, now_monotonic)
+            try:
+                if self.ring.config is not None:
+                    if lost:
+                        self.ring.observe_connection(authenticated=authenticated,
+                                                     connected=False, unexpected=True,
+                                                     now_us=now_us, clock_trusted=trusted)
+                    self.ring.observe_connection(authenticated=authenticated,
+                                                 connected=connected, unexpected=True,
+                                                 now_us=now_us, clock_trusted=trusted)
+                status = self.ring.tick(now_us=now_us, clock_trusted=trusted)
+            except RingRefused as exc:
+                status = {"state": "degraded", "reason": str(exc)}
         summary = {"state": status.get("state", "degraded"),
                    "reason": status.get("reason", "ring_status_unavailable")}
         if summary["reason"] != "not_configured" and self.reconfiguration_required:

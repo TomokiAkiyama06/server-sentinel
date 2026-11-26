@@ -133,7 +133,27 @@ def _ring(settings, store):
         raise
 
 
-def _capture(settings, launcher):
+def _recorders(settings, monitor, encoder):
+    """One ring recorder per source (Issue #16 PR C2), keyed by source UUID."""
+    from .recorder import SegmentRecorder
+    from .uvc_pipeline import MjpegProfile
+    recorders = {}
+    try:
+        for source in settings.capture.sources:
+            recorders[source.source_id] = SegmentRecorder(
+                source.source_id, MjpegProfile(source.width, source.height, source.fps),
+                settings.ring.source(source.source_id),
+                segment_seconds=settings.ring.segment_seconds, ring=monitor.ring,
+                monitor=monitor, launcher=encoder,
+                step_limit_seconds=settings.clock_step_limit_seconds)
+    except BaseException:
+        for recorder in recorders.values():
+            recorder.close()
+        raise
+    return recorders
+
+
+def _capture(settings, launcher, listeners=None):
     """The UVC capture of the configured sources and the live preview consumer."""
     from .preview import PreviewTap
     from .uvc_capture import UvcCapture, UvcSourceConfig
@@ -143,8 +163,8 @@ def _capture(settings, launcher):
                for source in settings.capture.sources]
     capture = UvcCapture(settings, sources, launcher=launcher)
     try:
-        preview = PreviewTap((source.source_id, capture.frames(source.source_id))
-                             for source in sources)
+        preview = PreviewTap(((source.source_id, capture.frames(source.source_id))
+                              for source in sources), listeners=listeners)
     except BaseException:
         capture.close()
         raise
@@ -163,6 +183,7 @@ def main(argv=None):
     agent = None
     store = None
     capture = preview = sender = None
+    recorders = {}
     stopped = threading.Event()
     previous = {}
     runtime_phase = False
@@ -189,16 +210,19 @@ def main(argv=None):
         # first (#116: fail closed before any capture; PR #412 review).
         agent = Agent(settings, store, session=session)
         launcher = _capture_launcher(settings)
-        _encoder_launcher(settings)
+        encoder = _encoder_launcher(settings)
         if settings.ring is not None and not args.check:
             # The ring ledger is the service's own state (like the approval
             # store's lock): `--check` never opens it.
             agent.ring = _ring(settings, store)
+            recorders = _recorders(settings, agent.ring, encoder)
         if launcher is not None and not args.check:
             # The approval store holds a runtime-wide lock, so `--check`
             # (also run by the installer while the service runs) only checks
             # the pipeline launcher; the service opens the cameras.
-            capture, preview = _capture(settings, launcher)
+            capture, preview = _capture(settings, launcher,
+                                        {source: recorder.offer
+                                         for source, recorder in recorders.items()})
             agent.capture = capture
         if preview is not None and isinstance(session, IngestSession):
             # Issue #14 (option A): the newest JPEG of each source to the Main.
@@ -233,6 +257,13 @@ def main(argv=None):
             # Issue #16: the ring's fixed state and reason words.
             if agent.ring_status is not None:
                 status["ring"] = agent.ring_status
+            if recorders:
+                # Fixed counter names summed over the sources (no identifiers).
+                recording = {}
+                for recorder in recorders.values():
+                    for key, value in recorder.status().items():
+                        recording[key] = recording.get(key, 0) + value
+                status["recording"] = recording
             print(json.dumps(status), flush=True)
             # A new session's first acknowledgement gives the clock exchange:
             # send the next heartbeat at once rather than a whole interval
@@ -251,6 +282,9 @@ def main(argv=None):
             signal.signal(signum, handler)
         if sender is not None:
             sender.close()
+        # Recorders finish their queued segments before the ring closes.
+        for recorder in recorders.values():
+            recorder.close()
         try:
             if agent is not None:
                 agent.close()
