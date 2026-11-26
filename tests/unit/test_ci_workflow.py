@@ -124,7 +124,7 @@ class CIWorkflowTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         start = workflow.find("\n  agent-python-313:\n")
         self.assertNotEqual(-1, start, "CPython 3.13 Agent job is missing")
-        end = workflow.find("\n  ci:\n", start)
+        end = workflow.find("\n  agent-ubuntu-2404-apt:\n", start)
         self.assertNotEqual(-1, end)
         job = workflow[start:end]
         self.assertIn("\n          python-version: '3.13'\n", job)
@@ -148,6 +148,33 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertNotEqual(-1, tests, "Agent unit tests do not run on 3.13")
         self.assertEqual(sorted(steps + [tests]), steps + [tests])
         self.assertIn("\n        working-directory: agent\n", job)
+
+    def test_agent_tests_run_against_ubuntu_2404_apt_cryptography(self):
+        # Issue #428: a capture host runs the Agent with Ubuntu 24.04's apt
+        # python3-cryptography 41, which lacks APIs of the pinned wheel. All
+        # Agent unit tests must run against it, and the job must fail rather
+        # than silently test another Python or cryptography version.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        start = workflow.find("\n  agent-ubuntu-2404-apt:\n")
+        self.assertNotEqual(-1, start, "Ubuntu 24.04 apt Agent job is missing")
+        end = workflow.find("\n  ci:\n", start)
+        self.assertNotEqual(-1, end)
+        job = workflow[start:end]
+        self.assertIn("\n    runs-on: ubuntu-24.04\n", job)
+        install = job.find("sudo apt-get install --yes --no-install-recommends python3-cryptography\n")
+        versions = job.find('sys.exit(sys.version_info[:2] != (3, 12)\n'
+                            '                   or cryptography.__version__.split(".")[0] != "41"\n'
+                            '                   or not cryptography.__file__.startswith('
+                            '"/usr/lib/python3/dist-packages/"))')
+        tests = job.find("run: /usr/bin/python3 -s -m unittest discover -s tests -p 'test_*.py' -v\n")
+        self.assertNotEqual(-1, install, "the apt python3-cryptography is not installed")
+        self.assertNotEqual(-1, versions, "Python/cryptography versions are not enforced")
+        self.assertNotEqual(-1, tests, "Agent unit tests do not run on the apt packages")
+        self.assertLess(install, versions)
+        self.assertLess(versions, tests)
+        self.assertIn("\n        working-directory: agent\n", job)
+        # No setup-python: the system interpreter is the one under test.
+        self.assertNotIn("setup-python", job)
 
     def test_aggregate_ci_gate_requires_every_other_job_to_succeed(self):
         # The ruleset requires only the terminal `CI` check, so every other job
