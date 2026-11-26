@@ -125,6 +125,22 @@ def _assets_from_settings(human_access: HumanAccess, settings: Settings) -> bool
         return False
 
 
+class _RemoteSceneForwarder:
+    """Forwards remote live frames to the scene runtime once it exists (#205)."""
+
+    runtime = None
+
+    def on_remote_frame(self, source_id, stream, jpeg) -> None:
+        runtime = self.runtime
+        if runtime is not None:
+            runtime.on_remote_frame(source_id, stream, jpeg)
+
+    def on_remote_stream_end(self, source_id) -> None:
+        runtime = self.runtime
+        if runtime is not None:
+            runtime.on_remote_stream_end(source_id)
+
+
 def create_app(settings: Settings, *, database: Database | None = None,
                human_authorizer: HumanAuthorizer | None = None,
                owner_authorizer: OwnerAuthorizer | None = None,
@@ -207,7 +223,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # section, the newest live frame of each authorized `remote_agent`
     # source, in memory only; written by the ingest listener, read only by
     # the S7 frame pull.
-    remote_preview = RemotePreviewHub() if capture_ingest is not None else None
+    # Issue #205: remote agents' live JPEGs also feed scene monitoring. The
+    # hub exists before the scene runtime, so it calls a forwarder that the
+    # runtime is attached to once built (nothing reaches it before then).
+    remote_scene = _RemoteSceneForwarder()
+    remote_preview = (RemotePreviewHub(listener=remote_scene)
+                      if capture_ingest is not None else None)
     # Calibrated ROI movement / camera tamper (#205). Capture threads only
     # hand it a bounded sample; detection runs on its own worker and confirmed
     # observations go to the injected durable critical recorder. Without a
@@ -400,6 +421,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
                                                     references=calibration_references))
     scene_runtime = (SceneMonitoringRuntime(scene_monitoring, scene_monitoring_dependencies)
                      if scene_monitoring is not None else None)
+    remote_scene.runtime = scene_runtime
     if timeline is not None:
         scene_holder.append(scene_runtime)
     scene_calibration_service = (

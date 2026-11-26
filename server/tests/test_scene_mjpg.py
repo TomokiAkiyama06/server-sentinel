@@ -42,7 +42,7 @@ from app.detection.roi.runtime import (
 from tests.test_detector_roi import HEIGHT, SOURCE, WIDTH, pixels
 from tests.test_mjpg_sandbox import require_sandbox
 from tests.test_scene_runtime import (
-    INTERVAL, MOVED, OTHER, THIRD, Harness, binding, wait_for,
+    INTERVAL, MOVED, OTHER, SHIFTED, THIRD, Harness, binding, wait_for,
 )
 
 
@@ -1559,8 +1559,13 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         harness.runtime.start()
         self.assertEqual("capture_layout_incompatible", harness.frame().reason)
         self.assertIsNone(harness.pid())
+        # Issue #205: a remote agent's live JPEGs may use the MJPG decoder;
+        # only a packed (raw local) layout is refused for it.
+        binding(source_type=SourceType.REMOTE_AGENT, layout=MJPG_LAYOUT)
+        from app.detection.roi.runtime import PackedLumaLayout
         with self.assertRaises(ValueError):
-            binding(source_type=SourceType.REMOTE_AGENT, layout=MJPG_LAYOUT)
+            binding(source_type=SourceType.REMOTE_AGENT,
+                    layout=PackedLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, "YUYV"))
 
     def test_decoding_runs_on_the_scene_worker_not_the_capture_thread(self):
         threads = []
@@ -1661,3 +1666,71 @@ def supervisors(harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteMjpgHarness(MjpgHarness):
+    """Frames arrive as a remote agent's live JPEGs (``on_remote_frame``)."""
+
+    stream = (UUID(int=900), 1)
+
+    def queue(self, luma=None, source=SOURCE, advance=INTERVAL, data=None):
+        self.clock.value += advance
+        payload = data if data is not None else encode(luma or pixels())
+        self.runtime.on_remote_frame(source, self.stream, payload)
+
+
+class RemoteAgentSceneTests(unittest.TestCase):
+    """Issue #205: CS-800-style remote sources through the MJPG decoder child."""
+
+    def harness(self, *bindings, **options):
+        require_sandbox(self)
+        harness = RemoteMjpgHarness(*bindings, **options)
+        self.addCleanup(harness.runtime.stop)
+        return harness
+
+    def remote(self, source=SOURCE):
+        return binding(source, source_type=SourceType.REMOTE_AGENT, layout=MJPG_LAYOUT)
+
+    def test_remote_frames_confirm_server_movement(self):
+        harness = self.harness(self.remote())
+        harness.start()
+        harness.frame()
+        self.assertEqual(Observation.ABSENT, harness.frame().movement)
+        harness.frame(MOVED)
+        confirmed = harness.frame(MOVED)
+        self.assertEqual(Observation.PRESENT, confirmed.movement)
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
+
+    def test_a_new_ingest_session_starts_a_new_stream(self):
+        harness = self.harness(self.remote())
+        harness.start()
+        harness.frame()
+        harness.frame()
+        first = harness.runtime._slots[SOURCE].stream_id
+        harness.stream = (UUID(int=900), 2)
+        harness.frame()
+        self.assertNotEqual(first, harness.runtime._slots[SOURCE].stream_id)
+
+    def test_a_session_end_after_a_scene_shift_is_not_tamper(self):
+        # A network loss cannot be told from a pulled cable: untrusted.
+        harness = self.harness(self.remote())
+        harness.start()
+        harness.frame()
+        harness.frame()
+        shifted = harness.frame(SHIFTED)
+        self.assertEqual("global_scene_shift", shifted.tamper_reason)
+        harness.clock.value += 5
+        harness.runtime.on_remote_stream_end(SOURCE)
+        harness.runtime.step()
+        self.assertNotIn(CriticalKind.CAMERA_TAMPER, harness.recorder.kinds())
+        self.assertIsNone(harness.runtime._slots[SOURCE].last_remote_stream)
+
+    def test_frames_of_the_wrong_kind_are_ignored(self):
+        harness = self.harness(self.remote(), binding(OTHER, layout=MJPG_LAYOUT))
+        harness.start()
+        harness.runtime.on_uvc_frame(SOURCE, VideoFrame(encode(pixels()), 1, 0.0))
+        harness.runtime.on_remote_frame(OTHER, harness.stream, encode(pixels()))
+        harness.runtime.on_remote_frame(SOURCE, "not a stream", encode(pixels()))
+        harness.runtime.step()
+        self.assertEqual((0, 0), (harness.source(SOURCE).accepted, harness.source(OTHER).accepted))
+        harness.runtime.on_remote_stream_end(OTHER)  # a local source: no effect

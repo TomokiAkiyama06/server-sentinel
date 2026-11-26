@@ -115,7 +115,8 @@ class RemotePreviewHub:
                  maximum_sources_per_node: int = DEFAULT_MAXIMUM_SOURCES_PER_NODE,
                  max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
                  maximum_viewed_sources: int = DEFAULT_MAXIMUM_VIEWED_SOURCES,
-                 monotonic: Callable[[], float] = time.monotonic) -> None:
+                 monotonic: Callable[[], float] = time.monotonic,
+                 listener=None) -> None:
         if (isinstance(fresh_seconds, bool) or not isinstance(fresh_seconds, (int, float))
                 or not 0 < fresh_seconds <= 60
                 or any(type(value) is not int or value <= 0
@@ -137,6 +138,14 @@ class RemotePreviewHub:
         self._slots: dict[UUID, _RemoteSource] = {}
         self._refused = 0
         self._closed = False
+        # Issue #205: an optional consumer of every accepted frame and of each
+        # source's stream end (the scene runtime). Called outside the lock;
+        # it must not block and its errors are ignored.
+        if listener is not None and not (callable(getattr(listener, "on_remote_frame", None))
+                                         and callable(getattr(listener, "on_remote_stream_end",
+                                                              None))):
+            raise ValueError("remote preview listener is invalid")
+        self._listener = listener
 
     # -- ingest side (capture ingest session threads) ------------------------
 
@@ -151,7 +160,8 @@ class RemotePreviewHub:
             if current is not None and current >= generation:
                 return
             self._nodes[node_id] = generation
-            self._drop_locked(node_id)
+            ended = self._drop_locked(node_id)
+        self._notify_ended(ended)
 
     def close_node(self, node_id: UUID, generation: int) -> None:
         """That session ended: its frames and receive times go at once."""
@@ -161,7 +171,8 @@ class RemotePreviewHub:
             if self._nodes.get(node_id) != generation:
                 return
             del self._nodes[node_id]
-            self._drop_locked(node_id)
+            ended = self._drop_locked(node_id)
+        self._notify_ended(ended)
 
     def publish(self, node_id: UUID, generation: int, source_id: UUID, jpeg: bytes) -> bool:
         """Keep ``jpeg`` as the newest frame of ``source_id``; never raises.
@@ -200,24 +211,41 @@ class RemotePreviewHub:
                 slot.sequence += 1
                 slot.retained = _Retained(node_id, generation, now,
                                           PreviewFrame(slot.sequence, jpeg))
-            return True
+        if self._listener is not None:
+            try:
+                self._listener.on_remote_frame(source_id, (node_id, generation), jpeg)
+            except Exception:
+                pass
+        return True
 
     def clear(self) -> None:
         """The listener stopped: drop everything and accept nothing more."""
         with self._lock:
             self._closed = True
             self._nodes.clear()
+            ended = list(self._received)
             self._received.clear()
             for slot in self._slots.values():
                 slot.retained = None
+        self._notify_ended(ended)
 
-    def _drop_locked(self, node_id: UUID) -> None:
-        for source_id in [source for source, item in self._received.items()
-                          if item.node_id == node_id]:
+    def _drop_locked(self, node_id: UUID) -> list:
+        ended = [source for source, item in self._received.items() if item.node_id == node_id]
+        for source_id in ended:
             del self._received[source_id]
         for slot in self._slots.values():
             if slot.retained is not None and slot.retained.node_id == node_id:
                 slot.retained = None
+        return ended
+
+    def _notify_ended(self, sources) -> None:
+        if self._listener is None:
+            return
+        for source_id in sources:
+            try:
+                self._listener.on_remote_stream_end(source_id)
+            except Exception:
+                pass
 
     def _current_locked(self, node_id: UUID, generation: int, at: float, now: float) -> bool:
         return (self._nodes.get(node_id) == generation
