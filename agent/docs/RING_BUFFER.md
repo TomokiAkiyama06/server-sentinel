@@ -14,6 +14,36 @@ dependencies in #11/#13/#15/#17 and #8/#10. Issue #16 stays open until those and
 the physical Capture Node/Main/UVC tests pass. Calling this core directly from
 the synthetic harness is not a claim that production capture is operational.
 
+## Segment format (Issue #16 PR A)
+
+The Owner decided on 2026-11-26 (`docs/decisions/2026-11-26-agent-ring-h264.md`)
+that the ring stores H.264 encoded by OpenH264. Three standard-library modules
+prepare the bytes that `append` receives; none of them is wired into the service
+yet (PR C):
+
+- `frame_pacer.FramePacer` maps camera frames onto a fixed slot grid. Each slot
+  gets the newest frame captured at or before it: a late frame repeats the
+  previous one and surplus frames are dropped, both counted. A slot whose newest
+  frame is older than the hold limit is a gap, and consecutive gap slots are one
+  range. A segment therefore always has exactly `fps × duration` pictures, so its
+  duration is fixed and a GOP size that divides it puts an IDR picture at every
+  segment start.
+- `h264_annexb` splits the encoder's Annex B byte stream into bounded NAL units
+  and access units and parses the SPS (profile, level, chroma format, bit depth,
+  cropped size). `validate_segment` refuses a segment unless:
+  - it has exactly the expected access unit count;
+  - each access unit has a slice;
+  - the first access unit carries SPS, PPS and only IDR slices;
+  - every parameter set equals the first;
+  - only NAL types 1, 5, 6, 7, 8 and 9 appear.
+- `fmp4.write_segment` writes one self-contained fragmented MP4 per segment
+  (`ftyp`, `moov` with the `avcC` parameter sets, `moof`, `mdat`). It has a
+  single video track, a fixed sample duration, a sync flag per sample, and no
+  dates or identifying metadata.
+
+These checks establish structure only. Decodability is checked by an
+`openh264dec` child (D13), which PR B adds together with the encoder child.
+
 ## Inputs and control boundary
 
 `SegmentProfile` takes a source UUID, bounded/expected bitrate in bits per second,
