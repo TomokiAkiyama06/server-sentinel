@@ -245,31 +245,33 @@ jobs:
     # Issue #428: a capture host on Ubuntu 24.04 runs the Agent with the apt
     # python3 (3.12) and python3-cryptography (41.x), not the hash-pinned wheel
     # lock, so an API newer than 41 must fail CI rather than the production
-    # Agent. The image holds only those distribution packages; the checkout is
-    # mounted read-only so the tests see the repository layout.
+    # Agent. The runner is Ubuntu 24.04; its system interpreter imports the
+    # distribution package, and the job fails if another build is imported.
     needs: repository
     runs-on: ubuntu-24.04
-    # Includes building the image (base image pull and apt install).
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Build the pinned Ubuntu 24.04 apt image
-        run: docker build --file agent/Dockerfile.ubuntu2404-apt --tag agent-ubuntu-2404-apt agent
+      - name: Install the distribution python3-cryptography
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends python3-cryptography
       - name: Require the distribution Python 3.12 and cryptography 41
         run: |
-          docker run --rm --pull=never --network=none agent-ubuntu-2404-apt python3 -c '
+          /usr/bin/python3 -s -c '
           import sys, cryptography
-          print(sys.version, cryptography.__version__)
-          sys.exit(sys.version_info[:2] != (3, 12) or cryptography.__version__.split(".")[0] != "41")'
+          print(sys.version, cryptography.__version__, cryptography.__file__)
+          sys.exit(sys.version_info[:2] != (3, 12)
+                   or cryptography.__version__.split(".")[0] != "41"
+                   or not cryptography.__file__.startswith("/usr/lib/python3/dist-packages/"))'
       - name: Agent unit tests against the apt packages
-        run: |
-          docker run --rm --pull=never --network=none \
-            --user "$(id -u):$(id -g)" --env HOME=/tmp \
-            --volume "${GITHUB_WORKSPACE}:/src:ro" --workdir /src/agent \
-            agent-ubuntu-2404-apt \
-            python3 -m unittest discover -s tests -p 'test_*.py' -v
+        working-directory: agent
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTHONFAULTHANDLER: '1'
+        run: /usr/bin/python3 -s -m unittest discover -s tests -p 'test_*.py' -v
 
   ci:
     name: CI

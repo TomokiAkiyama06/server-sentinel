@@ -160,25 +160,21 @@ class CIWorkflowTests(unittest.TestCase):
         end = workflow.find("\n  ci:\n", start)
         self.assertNotEqual(-1, end)
         job = workflow[start:end]
-        build = job.find("docker build --file agent/Dockerfile.ubuntu2404-apt"
-                         " --tag agent-ubuntu-2404-apt agent\n")
-        versions = job.find("sys.exit(sys.version_info[:2] != (3, 12)"
-                            " or cryptography.__version__.split(\".\")[0] != \"41\")")
-        tests = job.find("python3 -m unittest discover -s tests -p 'test_*.py' -v\n")
-        self.assertNotEqual(-1, build, "the apt image is not built")
+        self.assertIn("\n    runs-on: ubuntu-24.04\n", job)
+        install = job.find("sudo apt-get install --yes --no-install-recommends python3-cryptography\n")
+        versions = job.find('sys.exit(sys.version_info[:2] != (3, 12)\n'
+                            '                   or cryptography.__version__.split(".")[0] != "41"\n'
+                            '                   or not cryptography.__file__.startswith('
+                            '"/usr/lib/python3/dist-packages/"))')
+        tests = job.find("run: /usr/bin/python3 -s -m unittest discover -s tests -p 'test_*.py' -v\n")
+        self.assertNotEqual(-1, install, "the apt python3-cryptography is not installed")
         self.assertNotEqual(-1, versions, "Python/cryptography versions are not enforced")
         self.assertNotEqual(-1, tests, "Agent unit tests do not run on the apt packages")
-        self.assertLess(build, versions)
+        self.assertLess(install, versions)
         self.assertLess(versions, tests)
-        self.assertEqual(2, job.count("--network=none"))
-        self.assertIn('--volume "${GITHUB_WORKSPACE}:/src:ro" --workdir /src/agent', job)
-        dockerfile = (ROOT / "agent/Dockerfile.ubuntu2404-apt").read_text(encoding="utf-8")
-        self.assertRegex(dockerfile, r"\nFROM ubuntu:24\.04@sha256:[0-9a-f]{64}\n")
-        self.assertIn("apt-get install --yes --no-install-recommends python3 python3-cryptography", dockerfile)
-        # Nothing from the build context enters the image (agent/.dockerignore
-        # is an allow-list for Dockerfile.ci; this image takes the mount only).
-        self.assertNotRegex(dockerfile, r"(?m)^(COPY|ADD) ")
-        self.assertRegex(dockerfile, r"(?m)^USER 65534:65534$")
+        self.assertIn("\n        working-directory: agent\n", job)
+        # No setup-python: the system interpreter is the one under test.
+        self.assertNotIn("setup-python", job)
 
     def test_aggregate_ci_gate_requires_every_other_job_to_succeed(self):
         # The ruleset requires only the terminal `CI` check, so every other job
