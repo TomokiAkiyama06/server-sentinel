@@ -115,6 +115,32 @@ instead would let `capture_admin` approve a camera the service cannot open.
 Before rolling back to a release without Issue #14 capture support, remove the
 `capture` section, which that release refuses as an unknown key.
 
+Issue #16: with a `ring` section the Owner chooses the ring's mode and value
+locally, the same way (service stopped, as the service account, a typed word on
+the controlling terminal):
+
+```bash
+sudo systemctl stop media-capture-agent.service
+sudo -u <service account> env PYTHONPATH=<installed artifact> python3 -m \
+    media_capture_agent.ring_admin configure --config <agent config> --mode capacity --value 100GiB
+#   type CONFIGURE; the ring refuses a value that cannot keep 10 minutes before
+#   a loss and record the 10 minutes after it at the same time
+sudo -u <service account> env PYTHONPATH=<installed artifact> python3 -m \
+    media_capture_agent.ring_admin status --config <agent config>
+sudo systemctl start media-capture-agent.service
+```
+
+`--mode duration --value <seconds>` keeps a target duration instead; a capacity
+takes bytes or a `MiB`/`GiB`/`TiB` suffix. `status` prints the mode and value,
+the estimate (bytes for a duration, duration for a capacity), ordinary and
+protected usage, filesystem free, the safety reserve, the state and every
+protected incident (bytes, expiry, state). `delete-incident <incident id>`
+(type `DELETE`) removes a protected incident before its 60 days end. Every
+command refuses `service_running` while the service runs; refusals are one
+fixed word. The recorder writes nothing until the ring is configured, and
+after a change of the `ring` section's profiles it waits for `configure` again
+(`ring_reconfiguration_required`).
+
 A serial the Agent ever latched as duplicated stays unapprovable for good:
 `capture_admin` records every latch it sees in `uvc-latched-serials.json`
 under the runtime root (SHA-256 digests of the identity, never a serial)
