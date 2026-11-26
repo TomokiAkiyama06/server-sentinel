@@ -68,8 +68,9 @@ Known limits:
 
 - The ring keeps "connected" in memory. A Main outage that begins while the
   Agent itself is restarting is therefore not a detected loss.
-- Until the Owner configures the ring (the local ring command, PR D), it
-  reports `not_configured` and no loss can be protected.
+- Until the Owner configures the ring with
+  `python -m media_capture_agent.ring_admin configure` (PR D; agent/README.md),
+  it reports `not_configured` and no loss can be protected.
 - While the ledger's committed profiles differ from the deployment's, it
   reports `ring_reconfiguration_required`.
 - The ring state appears only in the local status line (`"ring"`). A summary
